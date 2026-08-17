@@ -1,0 +1,48 @@
+# Isolated worktrees and Subagent-Driven scratch state
+.worktrees/
+.superpowers/
+
+# Datasets and generated COCO manifests
+/data/
+/new_data/
+/external_data/
+
+# Training, inference, and analysis artifacts
+/work_dirs/
+/output/
+/test_preds.json
+/test_metrics.json
+/test_metrics.csv
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.onnx
+
+# Archives and downloaded bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.crdownload
+
+# Python/build caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Editors and operating-system files
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
