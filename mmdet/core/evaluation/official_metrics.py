@@ -469,34 +469,6 @@ def evaluate_mmdet_results(results, gt_infos, score_thresholds):
     return evaluate_score_events(events, total_gt, thresholds)
 
 
-def _class_curves_by_score(events, ids):
-    """Exact cumulative (score → tp, fp) breakpoints for the given classes.
-
-    Assumes each class's events are sorted by descending score (true for
-    everything :func:`build_mmdet_score_events` produces). Tied scores are
-    consumed as one group so a breakpoint never splits a tie.
-    """
-    curves = {}
-    for cls_idx in ids:
-        rows = {}
-        tp = 0
-        fp = 0
-        index = 0
-        class_events = events.get(cls_idx, [])
-        while index < len(class_events):
-            score = class_events[index][0]
-            while (index < len(class_events)
-                    and class_events[index][0] == score):
-                if class_events[index][1]:
-                    tp += 1
-                else:
-                    fp += 1
-                index += 1
-            rows[score] = (tp, fp)
-        curves[cls_idx] = rows
-    return curves
-
-
 def search_superclass_thresholds(events, total_gt, max_fdr=0.19):
     """Search one exact operating threshold per superclass for training.
 
@@ -549,15 +521,15 @@ def search_superclass_thresholds(events, total_gt, max_fdr=0.19):
                 group_scores[0] + max(abs(group_scores[0]) * 1e-12, 1e-12)]
         else:
             candidates = [1.0]
-        curves = _class_curves_by_score(sorted_events, ids)
         best_key = None
         best_threshold = None
         for threshold in candidates:
             recalls = []
             fdrs = []
             for cls_idx in ids:
-                tp, fp = curves[cls_idx].get(threshold, (0, 0))
                 class_gt = int(total_gt.get(cls_idx, 0))
+                tp, fp, _ = _per_class_counts_at_threshold(
+                    sorted_events[cls_idx], class_gt, threshold)
                 recalls.append(tp / max(class_gt, 1))
                 fdrs.append(fp / max(fp + tp, 1))
             super_recall = sum(recalls) / len(recalls)

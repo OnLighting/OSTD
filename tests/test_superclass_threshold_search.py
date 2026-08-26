@@ -62,6 +62,24 @@ def test_search_independent_across_superclasses():
     assert second['thresholds_by_super']['vehicle'] == 0.51
 
 
+def test_group_threshold_counts_higher_scores_from_other_child_classes():
+    """A group threshold applies cumulatively to every child class."""
+    events, total_gt = _events_with_all_superclasses()
+    events[0] = [(0.90, 1)]
+    events[1] = [(0.80, 1)]
+    total_gt[0] = 1
+    total_gt[1] = 1
+
+    result = search_superclass_thresholds(
+        events, total_gt, max_fdr=0.19)
+
+    assert result['thresholds_by_super']['ship'] == 0.80
+    assert result['metrics']['per_class'][0]['tp'] == 1
+    assert result['metrics']['per_class'][1]['tp'] == 1
+    assert result['metrics']['by_super']['ship']['recall'] == \
+        pytest.approx(0.5)
+
+
 def test_search_fdr_boundary_is_inclusive():
     """A point whose superclass mean FDR equals the limit stays feasible.
 
