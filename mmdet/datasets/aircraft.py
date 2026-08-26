@@ -51,7 +51,24 @@ class AircraftDataset(CocoDataset):
             return eval_results
 
         # Build per-image GT annotation lists expected by the metric module.
-        gt_infos = [self.get_ann_info(i) for i in range(len(self))]
+        # ``get_ann_info`` returns parsed dicts with ``bboxes`` (xyxy) and
+        # ``labels`` (contiguous 0..N-1); the metric module consumes raw
+        # ``bbox`` (xywh) + ``category_id`` (dataset-native ids), so we
+        # convert via ``label2cat`` here.
+        label2cat = {label: cat for cat, label in self.cat2label.items()}
+        gt_infos = []
+        for i in range(len(self)):
+            ann_info = self.get_ann_info(i)
+            anns = []
+            for box, label in zip(ann_info.get('bboxes', []),
+                                  ann_info.get('labels', [])):
+                x1, y1, x2, y2 = box
+                anns.append({
+                    'bbox': [float(x1), float(y1),
+                             float(x2 - x1), float(y2 - y1)],
+                    'category_id': int(label2cat[int(label)]),
+                })
+            gt_infos.append(anns)
         flat_results = list(results)
         metrics = evaluate_mmdet_results(flat_results, gt_infos)
 

@@ -182,14 +182,12 @@ def evaluate_mmdet_results(results, gt_infos):
     """Compute per-class, superclass, official, and merged metrics.
 
     Args:
-        results (list[np.ndarray]): one ``(N, 5)`` array per class (xyxy+score).
-            Filtered with :func:`filter_mmdet_results` semantics applied here,
-            so callers may pass raw detections.
+        results (list[list[np.ndarray]]): one entry per image; each entry is
+            a list of 25 ``(N, 5)`` arrays (xyxy + score) indexed by class.
+            Filtering by per-class thresholds is applied internally.
         gt_infos (list[list[dict]]): one list per image; each ann dict has
             ``bbox`` (xywh) and ``category_id``. Image order must match
-            ``results`` if ``results`` is a list per image (this function
-            treats ``results`` as per-image-per-class). For a single-image
-            case, pass a single ``results`` entry.
+            ``results``.
 
     Returns:
         dict with keys ``per_class`` (list of dicts, one per category id 0..24),
