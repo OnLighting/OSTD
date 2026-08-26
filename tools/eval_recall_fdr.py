@@ -33,7 +33,7 @@ from collections import defaultdict
 import numpy as np
 
 from mmdet.core.evaluation import (CLASS_IOU_THRESHOLDS, CLASS_NAMES,
-                                   match_class)
+                                   aggregate_official_per_class, match_class)
 
 
 def _iou_xywh(box, boxes):
@@ -191,17 +191,6 @@ def average_precision_for_class(pred_by_img, gt_by_img, class_id, image_ids):
     return float(np.mean(interpolated))
 
 
-def super_of(name):
-    """Map a class name to its official三大类 group."""
-    if name in {'HM', 'LQS', 'QHS', 'MS'}:
-        return 'ship'
-    if name == 'FSC':
-        return 'vehicle'
-    if isinstance(name, str) and name.startswith('A'):
-        return 'aircraft'
-    return None
-
-
 def build_metrics_payload(overall, per_class_rows):
     """Build the JSON-serializable evaluation result."""
     per_class_json = []
@@ -346,33 +335,24 @@ def main():
               f'{rv:>7.4f}  {fv:>7.4f}  {prec_s:>7s}  {ap_s:>7s}  '
               f'{ap_tau:>4.2f}')
 
-    # P0-A: 三大类官方补充口径聚合
-    super_recalls = defaultdict(list)
-    super_fdrs = defaultdict(list)
-    for row in rows:
-        cid, name, *_ = row
-        sn = super_of(name)
-        if sn is None:
-            continue
-        super_recalls[sn].append(row[5])  # recall
-        super_fdrs[sn].append(row[6])     # fdr
-    super_avg = {}
-    for s in ('ship', 'aircraft', 'vehicle'):
-        rs = super_recalls.get(s, [])
-        fs = super_fdrs.get(s, [])
-        if not rs:
-            super_avg[s] = (None, None)
-            continue
-        super_avg[s] = (sum(rs) / len(rs), sum(fs) / len(fs))
-    valid_recalls = [v[0] for v in super_avg.values() if v[0] is not None]
-    valid_fdrs = [v[1] for v in super_avg.values() if v[1] is not None]
-    official_recall = (sum(valid_recalls) / len(valid_recalls)) if valid_recalls else float('nan')
-    official_fdr = (sum(valid_fdrs) / len(valid_fdrs)) if valid_fdrs else float('nan')
+    # Keep the standalone CLI aligned with training/checkpoint selection.
+    metric_rows = [{
+        'category_id': row[0],
+        'tp': row[2],
+        'fp': row[3],
+        'fn': row[4],
+        'recall': row[5],
+        'fdr': row[6],
+    } for row in rows]
+    by_super, official = aggregate_official_per_class(metric_rows)
+    official_recall = official['recall']
+    official_fdr = official['fdr']
 
     print()
     print('=== 官方补充口径（三大类均值再平均） ===')
     for s in ('ship', 'aircraft', 'vehicle'):
-        r, f = super_avg[s]
+        r = by_super[s]['recall']
+        f = by_super[s]['fdr']
         if r is None:
             print(f'{s:<8s}  (empty)')
         else:
@@ -393,16 +373,8 @@ def main():
             'map': None if math.isnan(mean_ap) else float(mean_ap),
         }
         # P0-A: official三大类字段
-        overall['official'] = {
-            'recall': float(official_recall),
-            'fdr': float(official_fdr),
-            'by_super': {
-                s: {
-                    'recall': None if super_avg[s][0] is None else float(super_avg[s][0]),
-                    'fdr':    None if super_avg[s][1] is None else float(super_avg[s][1]),
-                } for s in ('ship', 'aircraft', 'vehicle')
-            },
-        }
+        overall['official'] = dict(official)
+        overall['official']['by_super'] = by_super
         _emit_files(args.out_prefix, overall, rows, names)
 
 

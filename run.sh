@@ -58,6 +58,7 @@ SHIPRS_TRAIN_ANN="$(cfg_str "$DATA_ROOT")/external/shiprs_mapped_train.json"
 SHIPRS_IMG_PREFIX="$(cfg_str "$SHIPRS_ROOT")/"
 
 cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 log() { printf '[run.sh] %s\n' "$*"; }
 
@@ -230,7 +231,8 @@ python tools/compose_big_val.py \
     --img-dir "$DATA_ROOT/images/val" \
     --out-dir "$BIG_VAL_ROOT" \
     --num-canvases "$BIG_IMAGE_COUNT" \
-    --seed 0
+    --seed 0 \
+    --overwrite
 
 log "Running sliding-window batch inference on mosaics"
 python tools/infer_big_image.py \

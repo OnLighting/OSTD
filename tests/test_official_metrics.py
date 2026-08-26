@@ -134,44 +134,27 @@ def test_superclass_average_excludes_missing_class():
 
 
 def test_matcher_skips_already_matched_gt():
-    """Two overlapping GTs; pred-2's highest-IoU GT is the one already
-    taken by pred-1, but pred-2 also matches the OTHER GT above τ.
-
-    Correct behaviour: 2 TP. The previous bug picked the highest-IoU
-    GT globally (the already-taken one), refused the match, and
-    demoted pred-2 to FP — losing one TP for every duplicate.
-    """
+    """A prediction falls back to its best still-unmatched GT."""
     import math
 
     result = _empty_result()
-    # GT-A (0,0,10,10), GT-B (3,0,10,10) → overlap = 70, IoU(A,B) = 70/130 ≈ 0.538.
-    # pred-1 (0,0,10,10) score .9 → IoU with A=1.0, with B=0.538. Matches A.
-    # pred-2 (3,0,10,10) score .8 → IoU with A=0.538, with B=1.0.
-    # Without the fix: argmax picks A (0.538 > 1.0? no — A=0.538 for pred-2,
-    # B=1.0). Actually here B is higher IoU for pred-2. So this case doesn't
-    # exercise the bug as cleanly. We want pred-2's IoU(A) > IoU(B) but B
-    # still above τ. Let's adjust:
-    # pred-2 (4,0,10,10) → IoU with A: overlap (4,0,10,10)∩(0,0,10,10)=60,
-    # union=140, IoU=0.43. With B: overlap (4,0,10,10)∩(3,0,10,10)=90,
-    # union=110, IoU=0.82. Hmm, still B is higher.
-    # The bug needs: pred's argmax-over-all-GT picks a taken one. Let's add
-    # a third pred-3 that has IoU(A)=0.7 and IoU(B)=0.6:
+    # Both predictions are exact matches for GT-A. After the higher-scoring
+    # prediction takes A, the second must ignore A and match overlapping GT-B
+    # at IoU 70/130 = 0.538 (> ship threshold 0.5).
     result[0] = np.array([
-        [0, 0, 10, 10, .9],   # pred-1: matches A (1.0)
-        [4, 0, 10, 10, .8],   # pred-2: B higher (1.0 vs A=0.43)
-        [0, 0, 10, 10, .7],   # pred-3: matches A (1.0) — duplicate
+        [0, 0, 10, 10, .9],
+        [0, 0, 10, 10, .8],
     ])
-    # After pred-1 takes A, pred-3 should also try A. Its best is A=1.0
-    # (still highest, but taken) and B=0.538. Buggy: argmax A → matched →
-    # pred-3 becomes FP. Fixed: A masked, argmax picks B (0.538 > τ=0.5)
-    # → pred-3 takes B as a new TP.
     metrics = evaluate_mmdet_results(
         [result],
         _gt([[[0, 0, 10, 10], [3, 0, 10, 10]]], [[0, 0]]))
     assert metrics['per_class'][0]['tp'] == 2
-    assert metrics['per_class'][0]['fp'] == 1
+    assert metrics['per_class'][0]['fp'] == 0
     assert metrics['per_class'][0]['fn'] == 0
-    assert not math.isnan(metrics['official']['recall'])
+    # This fixture contains ship GT only, so the matcher result is valid but
+    # the three-superclass official aggregate must remain unavailable.
+    assert math.isnan(metrics['official']['recall'])
+    assert metrics['official']['available'] is False
 
 
 def test_official_unavailable_when_vehicle_missing():

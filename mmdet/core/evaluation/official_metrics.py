@@ -203,6 +203,51 @@ def _convert_xyxy_to_xywh(boxes):
     return out
 
 
+def aggregate_official_per_class(per_class_rows):
+    """Aggregate 25 per-class rows using the official three-group rule.
+
+    A superclass with no GT makes the overall official metric unavailable;
+    it must not be silently averaged as a zero-valued group.
+    """
+    rows_by_id = {int(row['category_id']): row for row in per_class_rows}
+    expected_ids = set(range(len(CLASS_NAMES)))
+    if set(rows_by_id) != expected_ids or len(rows_by_id) != len(per_class_rows):
+        raise ValueError('per_class_rows must contain category_id 0..24 once')
+
+    by_super = {}
+    official_recalls = []
+    official_fdrs = []
+    unavailable_superclasses = []
+    for super_name, ids in SUPERCLASS_INDICES.items():
+        rows = [rows_by_id[i] for i in ids]
+        gt_total = sum(int(row['tp']) + int(row['fn']) for row in rows)
+        if gt_total == 0:
+            by_super[super_name] = {'recall': None, 'fdr': None}
+            unavailable_superclasses.append(super_name)
+            continue
+        recall = sum(float(row['recall']) for row in rows) / len(rows)
+        fdr = sum(float(row['fdr']) for row in rows) / len(rows)
+        by_super[super_name] = {'recall': recall, 'fdr': fdr}
+        official_recalls.append(recall)
+        official_fdrs.append(fdr)
+
+    if unavailable_superclasses or not official_recalls:
+        official = {
+            'recall': float('nan'),
+            'fdr': float('nan'),
+            'available': False,
+            'unavailable_superclasses': unavailable_superclasses,
+        }
+    else:
+        official = {
+            'recall': sum(official_recalls) / len(official_recalls),
+            'fdr': sum(official_fdrs) / len(official_fdrs),
+            'available': True,
+            'unavailable_superclasses': [],
+        }
+    return by_super, official
+
+
 def evaluate_mmdet_results(results, gt_infos):
     """Compute per-class, superclass, official, and merged metrics.
 
@@ -285,42 +330,7 @@ def evaluate_mmdet_results(results, gt_infos):
             'ap_iou_thr': CLASS_IOU_THRESHOLDS[cls_idx],
         })
 
-    by_super = {}
-    official_recalls = []
-    official_fdrs = []
-    unavailable_superclasses = []
-    for super_name, ids in SUPERCLASS_INDICES.items():
-        rs = [per_class_rows[i]['recall'] for i in ids]
-        fs = [per_class_rows[i]['fdr'] for i in ids]
-        gt_total = sum(per_class_rows[i]['tp'] + per_class_rows[i]['fn']
-                       for i in ids)
-        if gt_total == 0:
-            by_super[super_name] = {'recall': None, 'fdr': None}
-            unavailable_superclasses.append(super_name)
-            continue
-        r = sum(rs) / len(rs)
-        f = sum(fs) / len(fs)
-        by_super[super_name] = {'recall': r, 'fdr': f}
-        official_recalls.append(r)
-        official_fdrs.append(f)
-    # Per the design doc: if ANY official superclass (ship / aircraft / vehicle)
-    # is missing GT, the official aggregate is undefined — return NaN so the
-    # checkpoint hook can refuse to use this epoch as best. Do not substitute
-    # zero (which would silently misrank a passing run).
-    if unavailable_superclasses or not official_recalls:
-        official = {
-            'recall': float('nan'),
-            'fdr': float('nan'),
-            'available': False,
-            'unavailable_superclasses': list(unavailable_superclasses),
-        }
-    else:
-        official = {
-            'recall': sum(official_recalls) / len(official_recalls),
-            'fdr': sum(official_fdrs) / len(official_fdrs),
-            'available': True,
-            'unavailable_superclasses': [],
-        }
+    by_super, official = aggregate_official_per_class(per_class_rows)
 
     overall_tp = sum(per_class_tp)
     overall_fp = sum(per_class_fp)
@@ -392,6 +402,7 @@ __all__ = [
     'CLASS_SCORE_THRESHOLDS',
     'CLASS_IOU_THRESHOLDS',
     'SUPERCLASS_INDICES',
+    'aggregate_official_per_class',
     'filter_mmdet_results',
     'evaluate_mmdet_results',
     'compare_official_candidates',

@@ -5,10 +5,14 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
+import torch
 
 from mmdet.core.evaluation import CLASS_SCORE_THRESHOLDS
+import tools.infer_big_image as big_image
 from tools.infer_big_image import (apply_class_thresholds,
                                    summarize_timings,
                                    tile_coords)
@@ -63,3 +67,97 @@ def test_tile_coords_handles_short_axis():
     # When size < tile, we still emit at least one tile.
     assert len(coords) >= 1
     assert coords[-1][1] == 300
+
+
+def test_inference_synchronizes_the_requested_cuda_device(monkeypatch):
+    """Timing must wait for the GPU selected by ``--device``."""
+    synchronized = []
+    monkeypatch.setattr(big_image.torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(
+        big_image.torch.cuda,
+        'synchronize',
+        lambda device=None: synchronized.append(device))
+    monkeypatch.setattr(
+        big_image,
+        '_run_patch',
+        lambda model, patch: [np.zeros((0, 5), dtype=np.float32)
+                              for _ in range(25)])
+
+    big_image.infer_big_image(
+        model=None,
+        image=np.zeros((2, 2, 3), dtype=np.uint8),
+        tile=2,
+        overlap=0.0,
+        device='cuda:1')
+
+    assert synchronized == [torch.device('cuda:1'), torch.device('cuda:1')]
+
+
+def _batch_args(tmp_path, img_dir, gt_path):
+    return SimpleNamespace(
+        gt=str(gt_path),
+        img_dir=str(img_dir),
+        out=str(tmp_path / 'pred.json'),
+        timing_out=str(tmp_path / 'timing.json'),
+        tile=2,
+        overlap=0.0,
+        iou=0.5,
+        max_det=3000,
+        no_class_aware_nms=False,
+        device='cpu')
+
+
+def test_batch_rejects_missing_gt_image(tmp_path):
+    img_dir = tmp_path / 'images'
+    img_dir.mkdir()
+    (img_dir / 'one.jpg').write_bytes(b'placeholder')
+    gt_path = tmp_path / 'gt.json'
+    gt_path.write_text(json.dumps({
+        'images': [
+            {'id': 1, 'file_name': 'one.jpg'},
+            {'id': 2, 'file_name': 'two.jpg'},
+        ],
+        'annotations': [],
+    }), encoding='utf-8')
+    cfg = SimpleNamespace(data=SimpleNamespace(
+        test=SimpleNamespace(pipeline=[None, SimpleNamespace(img_scale=(2, 2))])))
+
+    with pytest.raises(ValueError, match='GT/image directory mismatch'):
+        big_image._run_batch(
+            _batch_args(tmp_path, img_dir, gt_path), model=None, cfg=cfg)
+
+
+def test_batch_assigns_unique_annotation_ids(tmp_path, monkeypatch):
+    img_dir = tmp_path / 'images'
+    img_dir.mkdir()
+    for name in ('one.jpg', 'two.jpg'):
+        (img_dir / name).write_bytes(b'placeholder')
+    gt_path = tmp_path / 'gt.json'
+    gt_path.write_text(json.dumps({
+        'images': [
+            {'id': 1, 'file_name': 'one.jpg'},
+            {'id': 2, 'file_name': 'two.jpg'},
+        ],
+        'annotations': [],
+    }), encoding='utf-8')
+    cfg = SimpleNamespace(data=SimpleNamespace(
+        test=SimpleNamespace(pipeline=[None, SimpleNamespace(img_scale=(2, 2))])))
+    monkeypatch.setattr(
+        big_image, 'read_image_fast',
+        lambda path: np.zeros((2, 2, 3), dtype=np.uint8))
+    monkeypatch.setattr(
+        big_image, 'infer_big_image',
+        lambda *args, **kwargs: ([{
+            'id': 1,
+            'category_id': 0,
+            'bbox': [0, 0, 1, 1],
+            'score': 0.9,
+            'area': 1.0,
+        }], 0.1, 1))
+
+    args = _batch_args(tmp_path, img_dir, gt_path)
+    big_image._run_batch(args, model=None, cfg=cfg)
+
+    payload = json.loads(Path(args.out).read_text(encoding='utf-8'))
+    assert [ann['id'] for ann in payload['annotations']] == [1, 2]
+    assert [ann['image_id'] for ann in payload['annotations']] == [1, 2]

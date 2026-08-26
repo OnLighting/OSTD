@@ -68,6 +68,13 @@ from mmdet.core.evaluation import (CLASS_NAMES, CLASS_SCORE_THRESHOLDS,
 _MIN_SCORE_FLOOR = 0.0
 
 
+def _synchronize_cuda(device):
+    """Synchronize only the CUDA device used for this inference run."""
+    selected = torch.device(device)
+    if selected.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize(device=selected)
+
+
 def read_image_fast(path):
     """cv2.imdecode from bytes — fastest decoder on Windows for the 20s budget."""
     with open(path, 'rb') as f:
@@ -192,8 +199,7 @@ def infer_big_image(model, image, tile=800, overlap=0.25, iou_thr=0.5,
 
     boxes_all, scores_all, cls_all = [], [], []
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    _synchronize_cuda(device)
     infer_t0 = time.perf_counter()
     patch_count = 0
     for (y0, y1) in ys:
@@ -251,8 +257,7 @@ def infer_big_image(model, image, tile=800, overlap=0.25, iou_thr=0.5,
             'score': float(s),
             'area': float((x2 - x1) * (y2 - y1)),
         })
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    _synchronize_cuda(device)
     elapsed = time.perf_counter() - infer_t0
     return annotations, elapsed, patch_count
 
@@ -349,11 +354,22 @@ def _run_batch(args, model, cfg):
     with open(gt_path, 'r', encoding='utf-8') as f:
         gt = json.load(f)
     name_to_id = {im['file_name']: im['id'] for im in gt['images']}
+    if len(name_to_id) != len(gt['images']):
+        raise ValueError('mosaic GT contains duplicate file_name values')
 
     img_dir = Path(args.img_dir)
-    img_files = sorted(p for p in img_dir.iterdir()
-                       if p.is_file() and p.suffix.lower() in
-                       {'.jpg', '.jpeg', '.png', '.bmp'})
+    discovered = {
+        p.name: p for p in img_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in
+        {'.jpg', '.jpeg', '.png', '.bmp'}
+    }
+    missing = sorted(set(name_to_id) - set(discovered))
+    unexpected = sorted(set(discovered) - set(name_to_id))
+    if missing or unexpected:
+        raise ValueError(
+            'GT/image directory mismatch: missing={}, unexpected={}'.format(
+                missing, unexpected))
+    img_files = [discovered[im['file_name']] for im in gt['images']]
     print(f'Found {len(img_files)} mosaic images.')
 
     test_scale = cfg.data.test.pipeline[1].img_scale
@@ -381,7 +397,9 @@ def _run_batch(args, model, cfg):
             raise KeyError(
                 f'mosaic {img_path.name} not in GT file_name set; '
                 'check that --gt points at the matching big_val GT')
-        for ann in annotations:
+        next_annotation_id = len(ann_all) + 1
+        for offset, ann in enumerate(annotations):
+            ann['id'] = next_annotation_id + offset
             ann['image_id'] = int(image_id)
         ann_all.extend(annotations)
         print(f'  {idx}/{len(img_files)}  {img_path.name}  '
