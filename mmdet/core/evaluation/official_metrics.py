@@ -150,6 +150,21 @@ def _match_class(pred_boxes, pred_scores, gt_boxes, tau):
 # --- Public API ---------------------------------------------------------
 
 
+def match_class(pred_boxes, pred_scores, gt_boxes, tau):
+    """Public wrapper for one-to-one matching for a single (image, class) pair.
+
+    Args:
+        pred_boxes (np.ndarray): (P, 4) xywh prediction boxes.
+        pred_scores (np.ndarray): (P,) prediction scores.
+        gt_boxes (np.ndarray): (G, 4) xywh GT boxes.
+        tau (float): IoU threshold for this class.
+
+    Returns:
+        tuple[int, int, int]: (tp, fp, fn) counts for this (image, class).
+    """
+    return _match_class(pred_boxes, pred_scores, gt_boxes, tau)
+
+
 def filter_mmdet_results(results):
     """Filter each class's predictions by its fixed score threshold.
 
@@ -380,4 +395,5 @@ __all__ = [
     'filter_mmdet_results',
     'evaluate_mmdet_results',
     'compare_official_candidates',
+    'match_class',
 ]

@@ -32,11 +32,17 @@ from collections import defaultdict
 
 import numpy as np
 
-from mmdet.core.evaluation import CLASS_IOU_THRESHOLDS, CLASS_NAMES
+from mmdet.core.evaluation import (CLASS_IOU_THRESHOLDS, CLASS_NAMES,
+                                   match_class)
 
 
 def _iou_xywh(box, boxes):
-    """Vector IoU between one box and an array of boxes (COCO xywh)."""
+    """Vector IoU between one box and an array of boxes (COCO xywh).
+
+    Kept for AP computation only; the per-class TP/FP/FN confusion counts
+    go through :func:`mmdet.core.evaluation.match_class` so this CLI and
+    the training EvalHook agree on the matching rules.
+    """
     if len(boxes) == 0:
         return np.zeros((0,), np.float32)
     x1 = box[0]
@@ -98,10 +104,11 @@ def group_by_image_and_class(records, has_score):
 def aggregate_confusion_counts(pred_by_img, gt_by_img, image_ids):
     """Aggregate per-class TP, FP, and FN across all official images.
 
-    Implemented locally (rather than going through
-    ``evaluate_mmdet_results``) so this CLI can also report AP, which
-    the shared module deliberately omits. The matching logic mirrors
-    ``official_metrics._match_class`` to stay consistent.
+    The matching step is delegated to
+    :func:`mmdet.core.evaluation.match_class` so this CLI and the
+    training-time EvalHook share one source of truth. The local loop only
+    iterates over (image, class) pairs and accumulates per-class counts,
+    leaving the greedy one-to-one matching to the shared helper.
     """
     total_tp = defaultdict(int)
     total_fp = defaultdict(int)
@@ -118,31 +125,13 @@ def aggregate_confusion_counts(pred_by_img, gt_by_img, image_ids):
                     'boxes': np.zeros((0, 4), dtype=np.float32),
                     'scores': np.zeros((0,), dtype=np.float32),
                 })
-            gt_boxes = gt_entry['boxes']
-            n_gt = len(gt_boxes)
-            n_p = len(p_entry['boxes'])
-            gt_matched = np.zeros(n_gt, dtype=bool)
-            pr_matched = np.zeros(n_p, dtype=bool)
-            if n_p == 0:
-                total_fn[c] += n_gt
-                continue
-            order = np.argsort(-p_entry['scores'])
             tau = CLASS_IOU_THRESHOLDS[int(c)]
-            for pi in order:
-                b = p_entry['boxes'][pi]
-                best_iou, best_gi = 0.0, -1
-                for gi in range(n_gt):
-                    if gt_matched[gi]:
-                        continue
-                    iou = _iou_xywh(b, gt_boxes[gi:gi + 1])[0]
-                    if iou > best_iou:
-                        best_iou, best_gi = iou, gi
-                if best_gi >= 0 and best_iou >= tau:
-                    gt_matched[best_gi] = True
-                    pr_matched[pi] = True
-            total_tp[c] += int(pr_matched.sum())
-            total_fp[c] += int((~pr_matched).sum())
-            total_fn[c] += int((~gt_matched).sum())
+            tp, fp, fn = match_class(
+                p_entry['boxes'], p_entry['scores'],
+                gt_entry['boxes'], tau)
+            total_tp[c] += tp
+            total_fp[c] += fp
+            total_fn[c] += fn
     return total_tp, total_fp, total_fn
 
 
