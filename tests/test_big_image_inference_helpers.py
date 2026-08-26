@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 import torch
 
-from mmdet.core.evaluation import CLASS_SCORE_THRESHOLDS
+from mmdet.core.evaluation import write_threshold_artifact
 import tools.infer_big_image as big_image
 from tools.infer_big_image import (apply_class_thresholds,
                                    summarize_timings,
@@ -20,8 +20,7 @@ from tools.infer_big_image import (apply_class_thresholds,
 
 BOXES = np.array([[0.0, 0.0, 10.0, 10.0],
                   [50.0, 50.0, 80.0, 80.0]], dtype=np.float32)
-SCORES = np.array([CLASS_SCORE_THRESHOLDS[0] - 1e-6,
-                   CLASS_SCORE_THRESHOLDS[1]], dtype=np.float32)
+SCORES = np.array([0.49, 0.50], dtype=np.float32)
 CLASSES = np.array([0, 1], dtype=np.int32)
 
 
@@ -40,10 +39,11 @@ def test_timing_summary_empty_returns_zero():
     assert summary['mean_inference_seconds'] == 0.0
 
 
-def test_final_filter_uses_class_thresholds():
+def test_final_filter_uses_loaded_class_thresholds():
     boxes, scores, classes = apply_class_thresholds(
         BOXES, SCORES, CLASSES,
-        nms_keep=np.array([0, 1], dtype=np.int32))
+        nms_keep=np.array([0, 1], dtype=np.int32),
+        score_thresholds=[0.50] * 25)
     # class 0 score below threshold → dropped; class 1 survives.
     assert classes.tolist() == [1]
     assert boxes.shape[0] == 1
@@ -88,6 +88,7 @@ def test_inference_synchronizes_the_requested_cuda_device(monkeypatch):
         image=np.zeros((2, 2, 3), dtype=np.uint8),
         tile=2,
         overlap=0.0,
+        score_thresholds=[0.0] * 25,
         device='cuda:1')
 
     assert synchronized == [torch.device('cuda:1'), torch.device('cuda:1')]
@@ -124,7 +125,8 @@ def test_batch_rejects_missing_gt_image(tmp_path):
 
     with pytest.raises(ValueError, match='GT/image directory mismatch'):
         big_image._run_batch(
-            _batch_args(tmp_path, img_dir, gt_path), model=None, cfg=cfg)
+            _batch_args(tmp_path, img_dir, gt_path), model=None, cfg=cfg,
+            score_thresholds=[0.0] * 25)
 
 
 def test_batch_assigns_unique_annotation_ids(tmp_path, monkeypatch):
@@ -156,8 +158,26 @@ def test_batch_assigns_unique_annotation_ids(tmp_path, monkeypatch):
         }], 0.1, 1))
 
     args = _batch_args(tmp_path, img_dir, gt_path)
-    big_image._run_batch(args, model=None, cfg=cfg)
+    big_image._run_batch(
+        args, model=None, cfg=cfg, score_thresholds=[0.0] * 25)
 
     payload = json.loads(Path(args.out).read_text(encoding='utf-8'))
     assert [ann['id'] for ann in payload['annotations']] == [1, 2]
     assert [ann['image_id'] for ann in payload['annotations']] == [1, 2]
+
+
+def test_runtime_thresholds_reject_different_checkpoint(tmp_path):
+    checkpoint_a = tmp_path / 'a.pth'
+    checkpoint_b = tmp_path / 'b.pth'
+    checkpoint_a.write_bytes(b'a')
+    checkpoint_b.write_bytes(b'b')
+    artifact = tmp_path / 'thresholds.json'
+    write_threshold_artifact(
+        artifact, [0.1] * 25, checkpoint_a, 'pred.json', 'gt.json',
+        {'max_official_fdr': 0.19},
+        {'official': {'recall': 0.85, 'fdr': 0.19}})
+    args = SimpleNamespace(
+        thresholds=str(artifact), checkpoint=str(checkpoint_b))
+
+    with pytest.raises(ValueError, match='SHA-256'):
+        big_image._load_runtime_thresholds(args)

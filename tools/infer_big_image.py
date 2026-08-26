@@ -5,8 +5,8 @@ of mosaic canvases), single 3090, ≤ 20 s budget per image (data
 reading excluded). The script tiles the input with ``tile`` × ``tile``
 patches, ``overlap`` overlap, runs CascadeRCNN_BAF on each patch,
 projects boxes back to full-image coordinates, merges cross-patch
-duplicates via class-aware NMS, and applies the fixed per-class score
-thresholds from :mod:`mmdet.core.evaluation.official_metrics`.
+duplicates via class-aware NMS, and applies a checkpoint-bound frozen
+threshold artifact.
 
 Two modes are supported:
 
@@ -30,6 +30,7 @@ Usage:
     python tools/infer_big_image.py \
         --config configs/bafnet/aircraft_bafnet_1x.py \
         --checkpoint work_dirs/aircraft/latest.pth \
+        --thresholds work_dirs/aircraft/final_thresholds.json \
         --img path/to/big.jpg \
         --out big.pred.json \
         --tile 800 --overlap 0.25 --iou 0.5
@@ -38,6 +39,7 @@ Usage:
     python tools/infer_big_image.py \
         --config configs/bafnet/aircraft_bafnet_1x.py \
         --checkpoint work_dirs/aircraft/best_official_recall_fdr.pth \
+        --thresholds work_dirs/aircraft/final_thresholds.json \
         --img-dir work_dirs/big_val/images \
         --gt work_dirs/big_val/instances_big_val.json \
         --out work_dirs/big_val/predictions.json \
@@ -58,14 +60,9 @@ from mmcv import Config
 from mmcv.ops import nms
 from mmdet.apis import init_detector
 
-from mmdet.core.evaluation import (CLASS_NAMES, CLASS_SCORE_THRESHOLDS,
-                                   filter_mmdet_results)
-
-
-# Minimum model-side score threshold. The per-class fixed thresholds
-# vary down to ~0.002 (LQS); the model stage must keep that low to
-# avoid losing LQS candidates before the per-class filter applies.
-_MIN_SCORE_FLOOR = 0.0
+from mmdet.core.evaluation import (CANDIDATE_SCORE_FLOOR, CLASS_NAMES,
+                                   load_threshold_artifact,
+                                   normalize_score_thresholds)
 
 
 def _synchronize_cuda(device):
@@ -139,19 +136,22 @@ def class_aware_nms(all_boxes, all_scores, all_cls, iou_thr, per_class=True):
     return np.zeros(0, dtype=int)
 
 
-def apply_class_thresholds(boxes, scores, classes, nms_keep):
-    """Apply per-class fixed score thresholds from official_metrics.
+def apply_class_thresholds(boxes, scores, classes, nms_keep,
+                           score_thresholds):
+    """Apply explicit per-class score thresholds after NMS.
 
     Args:
         boxes (np.ndarray): (N, 4) xyxy boxes after NMS.
         scores (np.ndarray): (N,) scores after NMS.
         classes (np.ndarray): (N,) class ids after NMS.
         nms_keep (np.ndarray): indices into the original arrays.
+        score_thresholds (sequence[float]): 25 frozen class thresholds.
 
     Returns:
         tuple[np.ndarray, np.ndarray, np.ndarray]: filtered boxes,
         scores, classes (xyxy, score, class).
     """
+    thresholds = normalize_score_thresholds(score_thresholds)
     if len(nms_keep) == 0:
         return (
             np.zeros((0, 4), dtype=np.float32),
@@ -162,7 +162,7 @@ def apply_class_thresholds(boxes, scores, classes, nms_keep):
     keep_scores = scores[nms_keep]
     keep_classes = classes[nms_keep]
     mask = np.array(
-        [keep_scores[i] >= CLASS_SCORE_THRESHOLDS[int(keep_classes[i])]
+        [keep_scores[i] >= thresholds[int(keep_classes[i])]
          for i in range(len(keep_scores))], dtype=bool)
     return (
         keep_boxes[mask].astype(np.float32, copy=False),
@@ -171,7 +171,8 @@ def apply_class_thresholds(boxes, scores, classes, nms_keep):
     )
 
 
-def infer_big_image(model, image, tile=800, overlap=0.25, iou_thr=0.5,
+def infer_big_image(model, image, score_thresholds, tile=800, overlap=0.25,
+                    iou_thr=0.5,
                     max_det=3000, no_class_aware_nms=False, device='cuda:0'):
     """Run one image through the sliding-window pipeline and time it.
 
@@ -181,6 +182,7 @@ def infer_big_image(model, image, tile=800, overlap=0.25, iou_thr=0.5,
     Args:
         model: an initialized mmdet detector.
         image (np.ndarray): HxWxC image (already decoded).
+        score_thresholds (sequence[float]): 25 frozen class thresholds.
         tile (int): patch side length.
         overlap (float): fractional overlap between adjacent patches.
         iou_thr (float): NMS IoU threshold.
@@ -239,7 +241,7 @@ def infer_big_image(model, image, tile=800, overlap=0.25, iou_thr=0.5,
         iou_thr=iou_thr, per_class=not no_class_aware_nms)
 
     f_boxes, f_scores, f_classes = apply_class_thresholds(
-        boxes_all, scores_all, cls_all, keep)
+        boxes_all, scores_all, cls_all, keep, score_thresholds)
 
     if len(f_boxes):
         order = np.argsort(-f_scores)
@@ -282,6 +284,8 @@ def _build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--thresholds', required=True,
+                        help='Frozen threshold JSON bound to --checkpoint.')
     parser.add_argument('--img', default=None,
                         help='Single image path. Use --img-dir for batch mode.')
     parser.add_argument('--out', default=None,
@@ -304,15 +308,16 @@ def _build_parser():
 
 def _init_model(args):
     cfg = Config.fromfile(args.config)
-    # Lower the model-side threshold to the minimum of all class thresholds
-    # so low-threshold classes survive the model stage and reach the
-    # per-class filter.
-    min_thr = max(_MIN_SCORE_FLOOR, float(min(CLASS_SCORE_THRESHOLDS)) - 1e-6)
-    cfg.model.test_cfg.rcnn.score_thr = min_thr
+    cfg.model.test_cfg.rcnn.score_thr = CANDIDATE_SCORE_FLOOR
     return init_detector(cfg, args.checkpoint, device=args.device), cfg
 
 
-def _run_single(args, model, cfg):
+def _load_runtime_thresholds(args):
+    """Validate artifact/checkpoint identity before model or image work."""
+    return load_threshold_artifact(args.thresholds, args.checkpoint)
+
+
+def _run_single(args, model, cfg, score_thresholds):
     img = read_image_fast(args.img)
     if img is None:
         raise SystemExit(f'Failed to read {args.img}')
@@ -322,7 +327,7 @@ def _run_single(args, model, cfg):
 
     # Read timing boundary: timer starts AFTER read_image_fast.
     annotations, elapsed, patch_count = infer_big_image(
-        model, img,
+        model, img, score_thresholds,
         tile=tile, overlap=args.overlap, iou_thr=args.iou,
         max_det=args.max_det,
         no_class_aware_nms=args.no_class_aware_nms,
@@ -349,7 +354,7 @@ def _run_single(args, model, cfg):
     print(f'wrote {out_path}  ({len(annotations)} boxes)')
 
 
-def _run_batch(args, model, cfg):
+def _run_batch(args, model, cfg, score_thresholds):
     gt_path = Path(args.gt)
     with open(gt_path, 'r', encoding='utf-8') as f:
         gt = json.load(f)
@@ -385,7 +390,7 @@ def _run_batch(args, model, cfg):
             continue
         H, W = img.shape[:2]
         annotations, elapsed, patch_count = infer_big_image(
-            model, img,
+            model, img, score_thresholds,
             tile=tile, overlap=args.overlap, iou_thr=args.iou,
             max_det=args.max_det,
             no_class_aware_nms=args.no_class_aware_nms,
@@ -431,15 +436,16 @@ def _run_batch(args, model, cfg):
 def main():
     parser = _build_parser()
     args = parser.parse_args()
+    score_thresholds = _load_runtime_thresholds(args)
     model, cfg = _init_model(args)
     if args.img_dir is not None:
         if args.out is None or args.gt is None:
             raise SystemExit('--img-dir requires --out and --gt')
-        _run_batch(args, model, cfg)
+        _run_batch(args, model, cfg, score_thresholds)
     else:
         if args.img is None or args.out is None:
             raise SystemExit('--img and --out are required in single-image mode')
-        _run_single(args, model, cfg)
+        _run_single(args, model, cfg, score_thresholds)
 
 
 if __name__ == '__main__':
