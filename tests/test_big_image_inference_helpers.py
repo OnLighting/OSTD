@@ -174,7 +174,10 @@ def test_runtime_thresholds_reject_different_checkpoint(tmp_path):
     artifact = tmp_path / 'thresholds.json'
     write_threshold_artifact(
         artifact, [0.1] * 25, checkpoint_a, 'pred.json', 'gt.json',
-        {'max_official_fdr': 0.19},
+        {
+            'max_official_fdr': 0.19,
+            'target_official_recall': 0.85,
+        },
         {'official': {'recall': 0.85, 'fdr': 0.19}})
     args = SimpleNamespace(
         thresholds=str(artifact), checkpoint=str(checkpoint_b))

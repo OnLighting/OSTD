@@ -79,8 +79,10 @@ def main():
     parser.add_argument('--config', required=True)
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--img-dir', required=True)
-    parser.add_argument('--gt', required=True,
-                        help='COCO gt json (for image id alignment).')
+    parser.add_argument(
+        '--gt', required=True,
+        help='COCO image manifest for image-id alignment; annotations may '
+             'be empty for the independent official test set.')
     parser.add_argument('--out', required=True)
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument(

@@ -227,8 +227,8 @@ model = dict(
             min_bbox_size=0),
         rcnn=dict(
             # score_thr 设为 0.0 以保留所有候选；每类真实过滤由共享模块
-            # ``mmdet.core.evaluation.official_metrics.filter_mmdet_results``
-            # 完成（最小硬编码阈值为 0.0019，0.0 必然保留）。
+            # ``mmdet.core.evaluation.official_metrics`` 中的训练期搜索或
+            # checkpoint 绑定的最终阈值产物完成；0.0 不提前丢弃候选。
             score_thr=0.0,
             nms=dict(type='nms', iou_threshold=0.5),
             # max_per_img 由 300 提到 3000，与 rpn_proposal 保持一致，避免在

@@ -105,6 +105,20 @@ bash run.sh
   separately supplied official test set remains external to this split and
   must only consume the frozen thresholds; it is never used for calibration.
 
+To run the separately supplied official test images, use their COCO image
+manifest (its `annotations` may be empty) and the same stage-2 checkpoint and
+frozen artifact:
+
+```bash
+python tools/eval_val_to_json.py \
+  --config configs/bafnet/aircraft_bafnet_1x.py \
+  --checkpoint work_dirs/shiprs_finetune_stage/best_official_recall_fdr.pth \
+  --thresholds work_dirs/shiprs_finetune_stage/final_thresholds.json \
+  --img-dir /path/to/official_test/images \
+  --gt /path/to/official_test/image_manifest.json \
+  --out work_dirs/shiprs_finetune_stage/official_test_predictions.json
+```
+
 ## Where to read more
 
 * Design spec: `docs/superpowers/specs/2026-08-26-official-recall-training-pipeline-design.md`

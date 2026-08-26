@@ -88,14 +88,47 @@ def load_json(path):
 
 def validate_inputs(pred, gt, class_count):
     for label, payload in (('prediction', pred), ('ground truth', gt)):
-        if 'images' not in payload or 'annotations' not in payload:
+        if ('images' not in payload or 'annotations' not in payload
+                or 'categories' not in payload):
             raise ValueError(
-                f'{label} JSON must contain images and annotations')
+                f'{label} JSON must contain images, annotations, '
+                'and categories')
 
-    pred_images = {image['id']: image.get('file_name')
-                   for image in pred['images']}
-    gt_images = {image['id']: image.get('file_name')
-                 for image in gt['images']}
+    category_maps = {}
+    for label, payload in (('prediction', pred), ('ground truth', gt)):
+        categories = payload['categories']
+        if not isinstance(categories, list) or len(categories) != class_count:
+            raise ValueError(
+                f'{label} categories must contain exactly {class_count} rows')
+        category_map = {}
+        for category in categories:
+            category_id = category.get('id')
+            name = category.get('name')
+            if (not isinstance(category_id, int)
+                    or not 0 <= category_id < class_count
+                    or category_id in category_map
+                    or not isinstance(name, str)):
+                raise ValueError(f'{label} categories are malformed')
+            category_map[category_id] = name
+        if set(category_map) != set(range(class_count)):
+            raise ValueError(
+                f'{label} categories must cover ids 0..{class_count - 1}')
+        category_maps[label] = category_map
+    if category_maps['prediction'] != category_maps['ground truth']:
+        raise ValueError('prediction/GT categories differ')
+
+    image_maps = {}
+    for label, payload in (('prediction', pred), ('ground truth', gt)):
+        image_map = {}
+        for image in payload['images']:
+            image_id = image.get('id')
+            if image_id in image_map:
+                raise ValueError(
+                    f'{label} contains duplicate image id={image_id}')
+            image_map[image_id] = image.get('file_name')
+        image_maps[label] = image_map
+    pred_images = image_maps['prediction']
+    gt_images = image_maps['ground truth']
     if set(pred_images) != set(gt_images):
         missing = sorted(set(gt_images) - set(pred_images))
         extra = sorted(set(pred_images) - set(gt_images))
@@ -496,6 +529,12 @@ def main():
     if args.classes != len(CLASS_NAMES) or tuple(names) != CLASS_NAMES:
         raise ValueError(
             'threshold search requires the official 25-class names/order')
+    category_names = tuple(
+        category['name']
+        for category in sorted(pred['categories'], key=lambda row: row['id']))
+    if category_names != CLASS_NAMES:
+        raise ValueError(
+            'prediction/GT categories must use the official 25-class names')
     events, total_gt = build_ranked_events(pred, gt, args.classes)
     missing_superclasses = [
         super_name for super_name, class_ids in SUPERCLASS_INDICES.items()

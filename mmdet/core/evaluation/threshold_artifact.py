@@ -30,11 +30,46 @@ def _validated_payload(payload):
     checkpoint = payload.get('checkpoint')
     if not isinstance(checkpoint, dict):
         raise ValueError('threshold artifact checkpoint must be an object')
+    checkpoint_path = checkpoint.get('path')
+    if not isinstance(checkpoint_path, str) or not checkpoint_path:
+        raise ValueError('checkpoint path must be a non-empty string')
     checkpoint_hash = checkpoint.get('sha256')
     if (not isinstance(checkpoint_hash, str)
             or len(checkpoint_hash) != 64
             or any(ch not in '0123456789abcdef' for ch in checkpoint_hash)):
-        raise ValueError('checkpoint sha256 must be a lowercase SHA-256 hex digest')
+        raise ValueError(
+            'checkpoint sha256 must be a lowercase SHA-256 hex digest')
+    source = payload.get('source')
+    if not isinstance(source, dict):
+        raise ValueError('threshold artifact source must be an object')
+    for key in ('prediction_path', 'gt_path'):
+        if not isinstance(source.get(key), str) or not source[key]:
+            raise ValueError(f'source {key} must be a non-empty string')
+    constraints = payload.get('constraints')
+    if not isinstance(constraints, dict):
+        raise ValueError('threshold artifact constraints must be an object')
+    for key in ('max_official_fdr', 'target_official_recall'):
+        try:
+            value = float(constraints[key])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f'constraints {key} must be numeric')
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f'constraints {key} must be between 0 and 1')
+    metrics = payload.get('metrics')
+    if not isinstance(metrics, dict):
+        raise ValueError('threshold artifact metrics must be an object')
+    official = metrics.get('official')
+    if not isinstance(official, dict):
+        raise ValueError(
+            'threshold artifact metrics official must be an object')
+    for key in ('recall', 'fdr'):
+        try:
+            value = float(official[key])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f'metrics official {key} must be numeric')
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(
+                f'metrics official {key} must be between 0 and 1')
     classes = payload.get('classes')
     if not isinstance(classes, list) or len(classes) != len(CLASS_NAMES):
         raise ValueError('threshold artifact must contain exactly 25 classes')

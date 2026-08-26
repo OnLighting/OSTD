@@ -161,6 +161,7 @@ python tools/prepare_shiprs.py --shiprs-root "$SHIPRS_ROOT" \
     --out-json "$DATA_ROOT/external/shiprs_mapped_train.json" \
     --audit-csv "$DATA_ROOT/external/shiprs_mapping_audit.csv" \
     --summary-json "$DATA_ROOT/external/shiprs_summary.json"
+require_file "$SHIPRS_TRAIN_ANN"
 
 log "Stage 2: mixed fine-tune (load_from=$STAGE1_BEST, weights=$OFFICIAL_WEIGHT/$SHIPRS_WEIGHT)"
 mkdir -p "$FINETUNE_WORK"
@@ -205,6 +206,7 @@ latest_eval=$(ls -t "$FINETUNE_WORK"/bbox_eval/eval_*.json 2>/dev/null | head -n
 if [ -n "${latest_eval:-}" ]; then
     cp "$latest_eval" "$BBOX_JSON"
 fi
+require_file "$BBOX_JSON"
 
 log "Exporting dense val predictions at the candidate score floor"
 python tools/eval_val_to_json.py \
@@ -214,6 +216,7 @@ python tools/eval_val_to_json.py \
     --gt "$DATA_ROOT/annotations/instances_val.json" \
     --out "$VAL_DENSE_PRED" \
     --device "$DEVICE"
+require_file "$VAL_DENSE_PRED"
 
 log "Searching and freezing 25 class thresholds on official val"
 python tools/search_recall_fdr_thresholds.py \
@@ -233,6 +236,8 @@ python tools/eval_recall_fdr.py \
     --gt "$OFFICIAL_VAL_ANN" \
     --classes 25 --names "$NAMES" \
     --out-prefix "$VAL_METRICS_PREFIX"
+require_file "${VAL_METRICS_PREFIX}.json"
+require_file "${VAL_METRICS_PREFIX}.csv"
 
 BIG_VAL_ROOT="$FINETUNE_WORK/big_val"
 BIG_VAL_IMG_DIR="$BIG_VAL_ROOT/images"
@@ -250,6 +255,9 @@ python tools/compose_big_val.py \
     --num-canvases "$BIG_IMAGE_COUNT" \
     --seed 0 \
     --overwrite
+require_dir "$BIG_VAL_IMG_DIR"
+require_file "$BIG_VAL_GT"
+require_file "$BIG_VAL_MAP"
 
 log "Running sliding-window batch inference on mosaics"
 python tools/infer_big_image.py \
@@ -261,6 +269,8 @@ python tools/infer_big_image.py \
     --out "$BIG_VAL_PRED" \
     --timing-out "$BIG_VAL_TIMING" \
     --device "$DEVICE"
+require_file "$BIG_VAL_PRED"
+require_file "$BIG_VAL_TIMING"
 
 log "Reporting official metrics on mosaics"
 python tools/eval_recall_fdr.py \
@@ -268,6 +278,8 @@ python tools/eval_recall_fdr.py \
     --gt "$BIG_VAL_GT" \
     --classes 25 --names "$NAMES" \
     --out-prefix "$BIG_VAL_METRICS_PREFIX"
+require_file "${BIG_VAL_METRICS_PREFIX}.json"
+require_file "${BIG_VAL_METRICS_PREFIX}.csv"
 
 log "Done."
 log "Artifacts:"

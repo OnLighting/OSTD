@@ -18,7 +18,10 @@ def _write_valid_artifact(tmp_path):
         checkpoint,
         'dense.json',
         'val.json',
-        {'max_official_fdr': 0.19},
+        {
+            'max_official_fdr': 0.19,
+            'target_official_recall': 0.85,
+        },
         {'official': {'recall': 0.86, 'fdr': 0.18}},
     )
     return checkpoint, artifact
@@ -46,6 +49,15 @@ def test_artifact_rejects_different_checkpoint(tmp_path):
     (lambda payload: payload['classes'][0].update(threshold=-0.1),
      'non-negative'),
     (lambda payload: payload['checkpoint'].pop('sha256'), 'sha256'),
+    (lambda payload: payload.pop('source'), 'source'),
+    (lambda payload: payload['source'].pop('gt_path'), 'gt_path'),
+    (lambda payload: payload.pop('constraints'), 'constraints'),
+    (lambda payload: payload['constraints'].pop('max_official_fdr'),
+     'max_official_fdr'),
+    (lambda payload: payload['constraints'].pop('target_official_recall'),
+     'target_official_recall'),
+    (lambda payload: payload.pop('metrics'), 'metrics'),
+    (lambda payload: payload['metrics'].pop('official'), 'official'),
 ])
 def test_artifact_rejects_malformed_payload(tmp_path, mutation, message):
     checkpoint, artifact = _write_valid_artifact(tmp_path)

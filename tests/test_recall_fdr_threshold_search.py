@@ -3,6 +3,8 @@
 import json
 import sys
 
+import pytest
+
 from mmdet.core.evaluation import CLASS_NAMES
 from mmdet.core.evaluation.threshold_artifact import sha256_file
 from tools import search_recall_fdr_thresholds
@@ -71,3 +73,24 @@ def test_search_cli_writes_checkpoint_bound_versioned_artifact(
     assert [row['name'] for row in payload['classes']] == list(CLASS_NAMES)
     assert payload['constraints']['max_official_fdr'] == 0.19
     assert (tmp_path / 'final_thresholds_filtered_preds.json').is_file()
+
+
+@pytest.mark.parametrize('payload_name, mutation, message', [
+    ('pred', lambda payload: payload['images'].append(
+        dict(payload['images'][0])), 'duplicate image id'),
+    ('gt', lambda payload: payload['categories'].pop(), 'categories'),
+    ('pred', lambda payload: payload['categories'][0].update(name='wrong'),
+     'categories'),
+])
+def test_search_rejects_mismatched_dataset_identity(
+        tmp_path, payload_name, mutation, message):
+    pred_path, gt_path = _write_search_inputs(tmp_path)
+    path = pred_path if payload_name == 'pred' else gt_path
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    mutation(payload)
+    path.write_text(json.dumps(payload), encoding='utf-8')
+
+    pred = search_recall_fdr_thresholds.load_json(pred_path)
+    gt = search_recall_fdr_thresholds.load_json(gt_path)
+    with pytest.raises(ValueError, match=message):
+        search_recall_fdr_thresholds.validate_inputs(pred, gt, 25)
