@@ -173,6 +173,15 @@ def main():
     apply_model_ablation_config(cfg)
     model = build_detector(cfg.model, train_cfg=None, test_cfg=None)
     model.init_weights()
+    # === ShipRS 微调: 仅让目标列 (HM/LQS/QHS + background) 接受梯度 ===
+    # cfg.shiprs_class_mask=True 时启用,目标列号取自 cfg.shiprs_class_mask_targets;
+    # 默认 (0, 1, 2) 对应 HM/LQS/QHS。fc_cls 的其余列被 mask,严格保护其他 21 类。
+    if getattr(cfg, 'shiprs_class_mask', False):
+        from mmdet.models.utils.class_masked_backward import install_class_mask
+        install_class_mask(
+            model,
+            trainable_target_classes=tuple(
+                getattr(cfg, 'shiprs_class_mask_targets', (0, 1, 2))))
 
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:

@@ -52,7 +52,8 @@ def _concat_dataset(cfg, default_args=None):
 
 def build_dataset(cfg, default_args=None):
     from .dataset_wrappers import (ConcatDataset, RepeatDataset,
-                                   ClassBalancedDataset, DomainBalancedDataset)
+                                   ClassBalancedDataset, DomainBalancedDataset,
+                                   SourceBalancedDataset)
     if isinstance(cfg, (list, tuple)):
         dataset = ConcatDataset([build_dataset(c, default_args) for c in cfg])
     elif cfg['type'] == 'ConcatDataset':
@@ -71,6 +72,16 @@ def build_dataset(cfg, default_args=None):
             target_class_id=cfg.get('target_class_id', 3),
             domain_prefixes=cfg.get('domain_prefixes', ('01-PAN', '02-PAN', 'OTHER')),
             domain_extras=cfg.get('domain_extras', (1, 2, 2)),
+        )
+    elif cfg['type'] == 'SourceBalancedDataset':
+        # 复制自 model_v4 commit 3f11e6b：在主分支上以固定的源采样权重混合
+        # 多个数据源，用于 25 类主训 + ShipRS mapped COCO 的混合采样微调。
+        dataset = SourceBalancedDataset(
+            [build_dataset(data_cfg, default_args)
+             for data_cfg in cfg['datasets']],
+            source_weights=cfg.get('source_weights', (0.6, 0.4)),
+            epoch_length=cfg.get('epoch_length', None),
+            seed=cfg.get('seed', 20260817),
         )
     elif isinstance(cfg.get('ann_file'), (list, tuple)):
         dataset = _concat_dataset(cfg, default_args)

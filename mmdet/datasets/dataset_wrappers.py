@@ -1,5 +1,7 @@
 import bisect
 import math
+import numbers
+import random
 from collections import defaultdict
 
 import numpy as np
@@ -374,3 +376,148 @@ class DomainBalancedDataset:
 
     def get_cat_ids(self, idx):
         return self.dataset.get_cat_ids(self.repeat_indices[idx])
+
+
+# 复制自 model_v4 分支的 commit 3f11e6b (feat: add deterministic source-balanced
+# dataset wrapper)，用于在主分支上以固定的源采样权重混合多个数据源 (典型场景：
+# 25 类主训集 + ShipRS mapped COCO，强化 HM/LQS/QHS(+MS) 4 个船舰类)。
+@DATASETS.register_module()
+class SourceBalancedDataset:
+    """A deterministic fixed-ratio wrapper for multiple data sources.
+
+    The wrapper constructs its complete per-epoch index schedule once.  It
+    deliberately does not reshuffle that schedule: MMDetection's group
+    samplers own epoch shuffling, while keeping this layer static makes the
+    requested source ratio reproducible and auditable.
+
+    Args:
+        datasets (list[:obj:`Dataset`]): Source datasets with identical
+            ``CLASSES`` metadata.
+        source_weights (tuple[float]): Positive relative sampling weights for
+            every source.
+        epoch_length (int, optional): Number of samples in the static epoch.
+            If omitted, use the smallest length that covers every source at
+            least once at its normalized sampling weight.
+        seed (int): Seed used only for deterministic per-source offsets.
+    """
+
+    def __init__(self,
+                 datasets,
+                 source_weights=(0.6, 0.4),
+                 epoch_length=None,
+                 seed=20260817):
+        if not isinstance(datasets, (list, tuple)) or not datasets:
+            raise ValueError('datasets must be a non-empty list or tuple')
+        self.datasets = list(datasets)
+
+        if not isinstance(source_weights, (list, tuple)) or \
+                len(source_weights) != len(self.datasets):
+            raise ValueError('source_weights must match the number of datasets')
+        if any(not isinstance(weight, numbers.Real) or
+               isinstance(weight, bool) or not math.isfinite(float(weight)) or
+               float(weight) <= 0 for weight in source_weights):
+            raise ValueError('source_weights must be finite positive numbers')
+        total_weight = float(sum(source_weights))
+        if not math.isfinite(total_weight) or total_weight <= 0:
+            raise ValueError('source_weights must have a finite positive sum')
+        self.source_weights = tuple(
+            float(weight) / total_weight for weight in source_weights)
+
+        if not isinstance(seed, numbers.Integral) or isinstance(seed, bool):
+            raise ValueError('seed must be an integer')
+        self.seed = int(seed)
+
+        source_lengths = []
+        for dataset in self.datasets:
+            source_length = len(dataset)
+            if source_length <= 0:
+                raise ValueError('source datasets must be non-empty')
+            source_lengths.append(source_length)
+        self._source_lengths = tuple(source_lengths)
+
+        if not all(hasattr(dataset, 'CLASSES') for dataset in self.datasets):
+            raise ValueError('every source dataset must define CLASSES')
+        self.CLASSES = self.datasets[0].CLASSES
+        if any(dataset.CLASSES != self.CLASSES
+               for dataset in self.datasets[1:]):
+            raise ValueError('source datasets must have compatible CLASSES')
+
+        if epoch_length is None:
+            epoch_length = max(
+                int(math.ceil(length / weight))
+                for length, weight in zip(self._source_lengths,
+                                          self.source_weights))
+        elif not isinstance(epoch_length, numbers.Integral) or \
+                isinstance(epoch_length, bool) or epoch_length <= 0:
+            raise ValueError('epoch_length must be a positive integer')
+        self.epoch_length = int(epoch_length)
+
+        self.source_counts = self._allocate_source_counts()
+        self._schedule = self._build_schedule()
+        self.flag = self._build_flag()
+
+    def _allocate_source_counts(self):
+        """Allocate exact source counts with stable largest remainders."""
+        raw_counts = [weight * self.epoch_length
+                      for weight in self.source_weights]
+        source_counts = [int(math.floor(count)) for count in raw_counts]
+        remaining = self.epoch_length - sum(source_counts)
+        order = sorted(
+            range(len(self.datasets)),
+            key=lambda source_id: (-(raw_counts[source_id] -
+                                     source_counts[source_id]), source_id))
+        for source_id in order[:remaining]:
+            source_counts[source_id] += 1
+        return tuple(source_counts)
+
+    def _build_schedule(self):
+        """Interleave the allocated source counts and cycle local indices."""
+        random_state = random.Random(self.seed)
+        offsets = [random_state.randrange(length)
+                   for length in self._source_lengths]
+        selected_counts = [0] * len(self.datasets)
+        schedule = []
+        for position in range(self.epoch_length):
+            # The source with the greatest outstanding ideal quota is chosen.
+            # ``-source_id`` makes exact ties deterministic.
+            source_id = max(
+                range(len(self.datasets)),
+                key=lambda index: (
+                    self.source_counts[index] * (position + 1) -
+                    selected_counts[index] * self.epoch_length,
+                    -index))
+            local_index = (offsets[source_id] + selected_counts[source_id]) % \
+                self._source_lengths[source_id]
+            schedule.append((source_id, local_index))
+            selected_counts[source_id] += 1
+        if tuple(selected_counts) != self.source_counts:
+            raise RuntimeError('source schedule does not match source_counts')
+        return tuple(schedule)
+
+    def _build_flag(self):
+        """Construct an aspect-ratio group flag for every scheduled sample."""
+        flags = []
+        source_flags = []
+        for dataset, source_length in zip(self.datasets, self._source_lengths):
+            if hasattr(dataset, 'flag'):
+                source_flag = np.asarray(dataset.flag, dtype=np.uint8)
+                if source_flag.ndim != 1 or len(source_flag) != source_length:
+                    raise ValueError('dataset flag must match dataset length')
+            else:
+                source_flag = np.zeros(source_length, dtype=np.uint8)
+            source_flags.append(source_flag)
+        for source_id, local_index in self._schedule:
+            flags.append(source_flags[source_id][local_index])
+        return np.asarray(flags, dtype=np.uint8)
+
+    def __getitem__(self, idx):
+        source_id, local_index = self._schedule[idx]
+        return self.datasets[source_id][local_index]
+
+    def __len__(self):
+        return self.epoch_length
+
+    def get_cat_ids(self, idx):
+        """Get categories from the source sample selected by ``idx``."""
+        source_id, local_index = self._schedule[idx]
+        return self.datasets[source_id].get_cat_ids(local_index)
