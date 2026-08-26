@@ -7,13 +7,22 @@ official metrics. It is consumed by:
 * ``tools/eval_val_to_json`` (ordinary validation inference).
 * ``tools/infer_big_image`` (10k×10k mosaic inference).
 * ``tools/eval_recall_fdr`` (post-hoc reporting CLI).
+* ``tools/search_recall_fdr_thresholds`` (post-training threshold search).
 
-It exposes fixed per-class score thresholds, per-class IoU thresholds,
-the superclass (ship/aircraft/vehicle) grouping, the matching algorithm,
-the official/merged aggregation, and the comparator used by checkpoint
-hooks to choose the best model.
+It exposes the candidate score floor, per-class IoU thresholds, the
+superclass (ship/aircraft/vehicle) grouping, score-ranked matching
+events, explicit-threshold filtering/evaluation, the training-time
+per-superclass threshold search, the official/merged aggregation, and
+the comparator used by checkpoint hooks to choose the best model.
+
+Decision thresholds are **never** built in: every consumer must supply
+them explicitly (from the training-time search or the frozen checkpoint-
+bound artifact). The only module-level score constant is
+``CANDIDATE_SCORE_FLOOR``, which keeps model-side candidates alive
+before a decision threshold exists; it is not a decision threshold.
 """
 
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -29,17 +38,11 @@ CLASS_NAMES = (
     'A18_KC-10', 'A19_SU-34', 'A20_SU-24', 'FSC',
 )
 
-# Score thresholds — hard-coded from ret/threshold_search_fdr_0.19_selected.csv.
-# The CSV exists for audit only; runtime imports these literals so the
-# pipeline is self-contained.
-CLASS_SCORE_THRESHOLDS = (
-    .348537356, .00188686815, .00998581946, .0174246859,
-    .854384005, .554479778, .469661117, .424196422, .451967984,
-    .927510798, .927627504, .33063519, .791748285, .987444103,
-    .186482817, .69058013, .586889446, .936379254, .362753332,
-    .145738885, .877446949, .038396392, .141620845, .0739553422,
-    .0403826572,
-)
+# Candidate retention floor applied on the model side so that threshold
+# search never loses candidates before a decision threshold exists. This
+# is NOT a decision threshold; final filtering always uses explicit
+# thresholds supplied by the caller.
+CANDIDATE_SCORE_FLOOR = 0.0
 
 # Per-class IoU thresholds: 0.50 for ship/aircraft, 0.35 for FSC.
 CLASS_IOU_THRESHOLDS = tuple(0.35 if i == 24 else 0.5 for i in range(25))
@@ -50,6 +53,14 @@ SUPERCLASS_INDICES = {
     'vehicle': (24,),
 }
 
+SUPERCLASS_NAMES = ('ship', 'aircraft', 'vehicle')
+
+_SUPERCLASS_OF_INDEX = {
+    index: name
+    for name, indices in SUPERCLASS_INDICES.items()
+    for index in indices
+}
+
 
 def _validate_constants():
     """Assert that constants cover the expected category id range."""
@@ -57,9 +68,6 @@ def _validate_constants():
     if len(CLASS_NAMES) != 25:
         raise ValueError(
             f'CLASS_NAMES must cover 25 ids, got {len(CLASS_NAMES)}')
-    if len(CLASS_SCORE_THRESHOLDS) != 25:
-        raise ValueError(
-            'CLASS_SCORE_THRESHOLDS must cover 25 ids')
     if len(CLASS_IOU_THRESHOLDS) != 25:
         raise ValueError(
             'CLASS_IOU_THRESHOLDS must cover 25 ids')
@@ -70,6 +78,8 @@ def _validate_constants():
         raise ValueError(
             f'SUPERCLASS_INDICES must cover 0..24, missing '
             f'{sorted(expected - seen)}, extra {sorted(seen - expected)}')
+    if set(_SUPERCLASS_OF_INDEX) != expected:
+        raise ValueError('each category id must map to exactly one superclass')
 
 
 _validate_constants()
@@ -104,46 +114,58 @@ def _iou_xywh(box, boxes):
     return np.where(union > 0, inter / np.maximum(union, 1e-9), 0.0)
 
 
-def _match_class(pred_boxes, pred_scores, gt_boxes, tau):
-    """One-to-one matching for a single (image, class) pair.
+def match_class_events(pred_boxes, pred_scores, gt_boxes, tau):
+    """Score-ranked matching events for a single (image, class) pair.
 
     Predictions are processed in score-descending order. Each prediction
     is greedily matched to the highest-IoU **unmatched** GT above ``tau``.
-    Already-matched GTs are excluded from the candidate set so a prediction
-    whose highest-IoU GT is taken still has a chance to match a different
-    GT that crosses the threshold. Unmatched predictions → FP, unmatched
-    GT → FN.
+    Already-matched GTs are excluded from the candidate set so a
+    prediction whose highest-IoU GT is taken still has a chance to match
+    a different GT that crosses the threshold.
+
+    Because matching walks predictions in score-descending order,
+    retaining the events with ``score >= t`` (a prefix of the ranked
+    list) reproduces exactly the matches that filtering-then-matching
+    would produce — this is what lets thresholds be applied after
+    matching instead of before.
+
+    Args:
+        pred_boxes (np.ndarray): (P, 4) xywh prediction boxes.
+        pred_scores (np.ndarray): (P,) prediction scores.
+        gt_boxes (np.ndarray): (G, 4) xywh GT boxes.
+        tau (float): IoU threshold for this class.
+
+    Returns:
+        list[tuple[float, int]]: one ``(score, is_tp)`` per prediction,
+        sorted by descending score; ``is_tp`` is 1 for a TP and 0 for an
+        eventual FP at any threshold at or below ``score``.
     """
-    n_gt = len(gt_boxes)
-    n_p = len(pred_boxes)
-    if n_p == 0:
-        tp = 0
-        fp = 0
-        fn = n_gt
-        return tp, fp, fn
-    gt_matched = np.zeros(n_gt, dtype=bool)
-    pr_matched = np.zeros(n_p, dtype=bool)
-    order = np.argsort(-pred_scores)
-    for pi in order:
-        b = pred_boxes[pi]
-        if n_gt == 0:
-            break
-        ious = _iou_xywh(b, gt_boxes)
-        # Mask already-matched GTs before selecting the best. argmax on the
-        # full IoU vector would otherwise pick a taken GT and refuse the
-        # match even when a different unmatched GT still exceeds ``tau``.
-        masked = np.where(gt_matched, -1.0, ious)
-        best_gi = int(masked.argmax())
-        if gt_matched[best_gi]:
-            # All GTs are matched; remaining predictions are FP.
-            continue
-        best_iou = float(ious[best_gi])
-        if best_iou >= tau:
-            gt_matched[best_gi] = True
-            pr_matched[pi] = True
-    tp = int(pr_matched.sum())
-    fp = int((~pr_matched).sum())
-    fn = int((~gt_matched).sum())
+    pred_scores = np.asarray(pred_scores, dtype=np.float64).reshape(-1)
+    matched = np.zeros(len(gt_boxes), dtype=bool)
+    events = []
+    # Stable sort keeps tie order deterministic across runs.
+    for pred_index in np.argsort(-pred_scores, kind='stable'):
+        is_tp = 0
+        unmatched = np.flatnonzero(~matched)
+        if unmatched.size:
+            overlaps = _iou_xywh(pred_boxes[pred_index], gt_boxes[unmatched])
+            best_local = int(overlaps.argmax())
+            if overlaps[best_local] >= tau:
+                matched[unmatched[best_local]] = True
+                is_tp = 1
+        events.append((float(pred_scores[pred_index]), is_tp))
+    return events
+
+
+def _match_class(pred_boxes, pred_scores, gt_boxes, tau):
+    """One-to-one matching counts for a single (image, class) pair.
+
+    Thin counting wrapper over :func:`match_class_events`.
+    """
+    events = match_class_events(pred_boxes, pred_scores, gt_boxes, tau)
+    tp = sum(flag for _, flag in events)
+    fp = len(events) - tp
+    fn = len(gt_boxes) - tp
     return tp, fp, fn
 
 
@@ -165,18 +187,50 @@ def match_class(pred_boxes, pred_scores, gt_boxes, tau):
     return _match_class(pred_boxes, pred_scores, gt_boxes, tau)
 
 
-def filter_mmdet_results(results):
-    """Filter each class's predictions by its fixed score threshold.
+def normalize_score_thresholds(score_thresholds):
+    """Normalize caller-supplied decision thresholds to a 25-value tuple.
+
+    Args:
+        score_thresholds (float | sequence[float]): a scalar broadcast to
+            every class, or exactly ``len(CLASS_NAMES)`` finite
+            non-negative values.
+
+    Returns:
+        tuple[float, ...]: 25 finite non-negative thresholds.
+
+    Raises:
+        ValueError: on a wrong count or a non-finite/negative value.
+    """
+    if np.isscalar(score_thresholds):
+        values = [float(score_thresholds)] * len(CLASS_NAMES)
+    else:
+        values = [float(value) for value in score_thresholds]
+    if len(values) != len(CLASS_NAMES):
+        raise ValueError(
+            f'expected {len(CLASS_NAMES)} score thresholds, '
+            f'got {len(values)}')
+    for value in values:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                'score thresholds must be finite non-negative numbers')
+    return tuple(values)
+
+
+def filter_mmdet_results(results, score_thresholds):
+    """Filter each class's predictions by explicit score thresholds.
 
     Args:
         results (list[np.ndarray]): one ``(N, 5)`` array per class (x1, y1,
             x2, y2, score); empty arrays are fine.
+        score_thresholds (float | sequence[float]): scalar or 25 finite
+            non-negative thresholds, one per class.
 
     Returns:
         list[np.ndarray]: same length as ``results``, each row preserved as
             ``(x1, y1, x2, y2, score)`` and rows below the per-class
             threshold removed. Empty classes become ``np.zeros((0, 5))``.
     """
+    thresholds = normalize_score_thresholds(score_thresholds)
     if len(results) != len(CLASS_NAMES):
         raise ValueError(
             f'expected {len(CLASS_NAMES)} classes, got {len(results)}')
@@ -185,7 +239,7 @@ def filter_mmdet_results(results):
         if len(boxes) == 0:
             out.append(np.zeros((0, 5), dtype=np.float32))
             continue
-        keep = boxes[:, 4] >= CLASS_SCORE_THRESHOLDS[i]
+        keep = boxes[:, 4] >= thresholds[i]
         if not np.any(keep):
             out.append(np.zeros((0, 5), dtype=np.float32))
             continue
@@ -203,88 +257,30 @@ def _convert_xyxy_to_xywh(boxes):
     return out
 
 
-def aggregate_official_per_class(per_class_rows):
-    """Aggregate 25 per-class rows using the official three-group rule.
-
-    A superclass with no GT makes the overall official metric unavailable;
-    it must not be silently averaged as a zero-valued group.
-    """
-    rows_by_id = {int(row['category_id']): row for row in per_class_rows}
-    expected_ids = set(range(len(CLASS_NAMES)))
-    if set(rows_by_id) != expected_ids or len(rows_by_id) != len(per_class_rows):
-        raise ValueError('per_class_rows must contain category_id 0..24 once')
-
-    by_super = {}
-    official_recalls = []
-    official_fdrs = []
-    unavailable_superclasses = []
-    for super_name, ids in SUPERCLASS_INDICES.items():
-        rows = [rows_by_id[i] for i in ids]
-        gt_total = sum(int(row['tp']) + int(row['fn']) for row in rows)
-        if gt_total == 0:
-            by_super[super_name] = {'recall': None, 'fdr': None}
-            unavailable_superclasses.append(super_name)
-            continue
-        recall = sum(float(row['recall']) for row in rows) / len(rows)
-        fdr = sum(float(row['fdr']) for row in rows) / len(rows)
-        by_super[super_name] = {'recall': recall, 'fdr': fdr}
-        official_recalls.append(recall)
-        official_fdrs.append(fdr)
-
-    if unavailable_superclasses or not official_recalls:
-        official = {
-            'recall': float('nan'),
-            'fdr': float('nan'),
-            'available': False,
-            'unavailable_superclasses': unavailable_superclasses,
-        }
-    else:
-        official = {
-            'recall': sum(official_recalls) / len(official_recalls),
-            'fdr': sum(official_fdrs) / len(official_fdrs),
-            'available': True,
-            'unavailable_superclasses': [],
-        }
-    return by_super, official
-
-
-def evaluate_mmdet_results(results, gt_infos):
-    """Compute per-class, superclass, official, and merged metrics.
+def build_mmdet_score_events(results, gt_infos):
+    """Build per-class score-ranked matching events for an mmdet result set.
 
     Args:
         results (list[list[np.ndarray]]): one entry per image; each entry is
             a list of 25 ``(N, 5)`` arrays (xyxy + score) indexed by class.
-            Filtering by per-class thresholds is applied internally.
         gt_infos (list[list[dict]]): one list per image; each ann dict has
             ``bbox`` (xywh) and ``category_id``. Image order must match
             ``results``.
 
     Returns:
-        dict with keys ``per_class`` (list of dicts, one per category id 0..24),
-        ``by_super`` (dict ship/aircraft/vehicle → recall/fdr; missing GTs
-        produce ``None`` values),
-        ``official`` (dict with ``recall``, ``fdr``, ``available`` boolean,
-        and ``unavailable_superclasses`` list — the recall/fdr are ``NaN``
-        when any of ship/aircraft/vehicle has no GT, so callers like the
-        checkpoint hook can refuse to use the run), and ``merged``
-        (counts-based recall/fdr over every category).
+        tuple[dict[int, list[tuple[float, int]]], dict[int, int]]: per-class
+        events sorted by descending score, and the per-class GT totals.
     """
     if len(results) != len(gt_infos):
         raise ValueError(
             f'results has {len(results)} entries but gt_infos has '
             f'{len(gt_infos)}; must match image count')
-    per_class_tp = [0] * len(CLASS_NAMES)
-    per_class_fp = [0] * len(CLASS_NAMES)
-    per_class_fn = [0] * len(CLASS_NAMES)
+    events = {cls_idx: [] for cls_idx in range(len(CLASS_NAMES))}
+    total_gt = {cls_idx: 0 for cls_idx in range(len(CLASS_NAMES))}
     for img_results, img_gts in zip(results, gt_infos):
-        # img_results may be a list of 25 arrays (mmdet style) or a single
-        # ndarray when only one image is processed.
-        if isinstance(img_results, list):
-            per_class = img_results
-        else:
+        if not isinstance(img_results, list):
             raise ValueError(
                 'each per-image entry must be a list of 25 class arrays')
-        filtered = filter_mmdet_results(per_class)
         gt_by_class = defaultdict(list)
         for ann in img_gts:
             cat = int(ann['category_id'])
@@ -296,20 +292,66 @@ def evaluate_mmdet_results(results, gt_infos):
             gt_boxes = gt_by_class.get(cls_idx, [])
             gt_arr = (np.asarray(gt_boxes, dtype=np.float32).reshape(-1, 4)
                       if gt_boxes else np.zeros((0, 4), dtype=np.float32))
-            pred = filtered[cls_idx]
+            total_gt[cls_idx] += len(gt_arr)
+            pred = img_results[cls_idx]
             if len(pred) == 0:
-                pred_boxes = np.zeros((0, 4), dtype=np.float32)
-                pred_scores = np.zeros((0,), dtype=np.float32)
-            else:
-                pred_boxes = _convert_xyxy_to_xywh(pred)
-                pred_scores = pred[:, 4].astype(np.float32)
-            tau = CLASS_IOU_THRESHOLDS[cls_idx]
-            tp, fp, fn = _match_class(
-                pred_boxes, pred_scores, gt_arr, tau)
-            per_class_tp[cls_idx] += tp
-            per_class_fp[cls_idx] += fp
-            per_class_fn[cls_idx] += fn
+                continue
+            pred_boxes = _convert_xyxy_to_xywh(pred)
+            pred_scores = pred[:, 4].astype(np.float64)
+            events[cls_idx].extend(match_class_events(
+                pred_boxes, pred_scores, gt_arr,
+                CLASS_IOU_THRESHOLDS[cls_idx]))
+    for cls_idx in events:
+        events[cls_idx].sort(key=lambda item: item[0], reverse=True)
+    return events, total_gt
 
+
+def _per_class_counts_at_threshold(events, total_gt, threshold):
+    """Count (tp, fp, fn) for one class at ``threshold`` from its events."""
+    tp = 0
+    fp = 0
+    for score, flag in events:
+        if score >= threshold:
+            if flag:
+                tp += 1
+            else:
+                fp += 1
+    return tp, fp, total_gt - tp
+
+
+def evaluate_score_events(events, total_gt, score_thresholds):
+    """Compute official metrics from matching events at explicit thresholds.
+
+    Args:
+        events (dict[int, list[tuple[float, int]]]): per-class events as
+            produced by :func:`build_mmdet_score_events`. Only events with
+            ``score >= threshold`` count; event order is irrelevant.
+        total_gt (dict[int, int]): per-class GT totals.
+        score_thresholds (float | sequence[float]): scalar or 25 finite
+            non-negative decision thresholds.
+
+    Returns:
+        dict with keys ``per_class`` (list of dicts, one per category id
+        0..24), ``by_super``, ``official``, and ``merged`` — the same
+        shape :func:`evaluate_mmdet_results` returns.
+    """
+    thresholds = normalize_score_thresholds(score_thresholds)
+    per_class_tp = [0] * len(CLASS_NAMES)
+    per_class_fp = [0] * len(CLASS_NAMES)
+    per_class_fn = [0] * len(CLASS_NAMES)
+    for cls_idx in range(len(CLASS_NAMES)):
+        tp, fp, fn = _per_class_counts_at_threshold(
+            events.get(cls_idx, []), int(total_gt.get(cls_idx, 0)),
+            thresholds[cls_idx])
+        per_class_tp[cls_idx] = tp
+        per_class_fp[cls_idx] = fp
+        per_class_fn[cls_idx] = fn
+
+    return _aggregate_counts(per_class_tp, per_class_fp, per_class_fn)
+
+
+def _aggregate_counts(per_class_tp, per_class_fp, per_class_fn):
+    """Build the standard metrics payload from per-class TP/FP/FN counts."""
     per_class_rows = []
     for cls_idx, name in enumerate(CLASS_NAMES):
         tp = per_class_tp[cls_idx]
@@ -350,6 +392,212 @@ def evaluate_mmdet_results(results, gt_infos):
         'by_super': by_super,
         'official': official,
         'merged': merged,
+    }
+
+
+def aggregate_official_per_class(per_class_rows):
+    """Aggregate 25 per-class rows using the official three-group rule.
+
+    A superclass with no GT makes the overall official metric unavailable;
+    it must not be silently averaged as a zero-valued group.
+    """
+    rows_by_id = {int(row['category_id']): row for row in per_class_rows}
+    expected_ids = set(range(len(CLASS_NAMES)))
+    if set(rows_by_id) != expected_ids or len(rows_by_id) != len(per_class_rows):
+        raise ValueError('per_class_rows must contain category_id 0..24 once')
+
+    by_super = {}
+    official_recalls = []
+    official_fdrs = []
+    unavailable_superclasses = []
+    for super_name in SUPERCLASS_NAMES:
+        ids = SUPERCLASS_INDICES[super_name]
+        rows = [rows_by_id[i] for i in ids]
+        gt_total = sum(int(row['tp']) + int(row['fn']) for row in rows)
+        if gt_total == 0:
+            by_super[super_name] = {'recall': None, 'fdr': None}
+            unavailable_superclasses.append(super_name)
+            continue
+        recall = sum(float(row['recall']) for row in rows) / len(rows)
+        fdr = sum(float(row['fdr']) for row in rows) / len(rows)
+        by_super[super_name] = {'recall': recall, 'fdr': fdr}
+        official_recalls.append(recall)
+        official_fdrs.append(fdr)
+
+    if unavailable_superclasses or not official_recalls:
+        official = {
+            'recall': float('nan'),
+            'fdr': float('nan'),
+            'available': False,
+            'unavailable_superclasses': unavailable_superclasses,
+        }
+    else:
+        official = {
+            'recall': sum(official_recalls) / len(official_recalls),
+            'fdr': sum(official_fdrs) / len(official_fdrs),
+            'available': True,
+            'unavailable_superclasses': [],
+        }
+    return by_super, official
+
+
+def evaluate_mmdet_results(results, gt_infos, score_thresholds):
+    """Compute per-class, superclass, official, and merged metrics.
+
+    Args:
+        results (list[list[np.ndarray]]): one entry per image; each entry is
+            a list of 25 ``(N, 5)`` arrays (xyxy + score) indexed by class.
+        gt_infos (list[list[dict]]): one list per image; each ann dict has
+            ``bbox`` (xywh) and ``category_id``. Image order must match
+            ``results``.
+        score_thresholds (float | sequence[float]): scalar or 25 finite
+            non-negative decision thresholds. There is no module-level
+            default; callers pass searched/frozen values.
+
+    Returns:
+        dict with keys ``per_class`` (list of dicts, one per category id 0..24),
+        ``by_super`` (dict ship/aircraft/vehicle → recall/fdr; missing GTs
+        produce ``None`` values),
+        ``official`` (dict with ``recall``, ``fdr``, ``available`` boolean,
+        and ``unavailable_superclasses`` list — the recall/fdr are ``NaN``
+        when any of ship/aircraft/vehicle has no GT, so callers like the
+        checkpoint hook can refuse to use the run), and ``merged``
+        (counts-based recall/fdr over every category).
+    """
+    thresholds = normalize_score_thresholds(score_thresholds)
+    events, total_gt = build_mmdet_score_events(results, gt_infos)
+    return evaluate_score_events(events, total_gt, thresholds)
+
+
+def _class_curves_by_score(events, ids):
+    """Exact cumulative (score → tp, fp) breakpoints for the given classes.
+
+    Assumes each class's events are sorted by descending score (true for
+    everything :func:`build_mmdet_score_events` produces). Tied scores are
+    consumed as one group so a breakpoint never splits a tie.
+    """
+    curves = {}
+    for cls_idx in ids:
+        rows = {}
+        tp = 0
+        fp = 0
+        index = 0
+        class_events = events.get(cls_idx, [])
+        while index < len(class_events):
+            score = class_events[index][0]
+            while (index < len(class_events)
+                    and class_events[index][0] == score):
+                if class_events[index][1]:
+                    tp += 1
+                else:
+                    fp += 1
+                index += 1
+            rows[score] = (tp, fp)
+        curves[cls_idx] = rows
+    return curves
+
+
+def search_superclass_thresholds(events, total_gt, max_fdr=0.19):
+    """Search one exact operating threshold per superclass for training.
+
+    For each superclass, candidate thresholds are every distinct event
+    score in that superclass plus an empty-prediction threshold above its
+    maximum. One shared threshold is evaluated across every child class;
+    among points whose superclass mean FDR is at most ``max_fdr`` the
+    literal comparison key ``(recall, -fdr, threshold)`` picks the
+    highest Recall, then the lowest FDR, then the highest threshold.
+
+    A superclass with zero total GT has no defined operating point: its
+    threshold is ``None``, the official aggregate is reported
+    unavailable, and ``score_thresholds`` is ``None`` so callers cannot
+    silently fall back to a global value.
+
+    Args:
+        events (dict[int, list[tuple[float, int]]]): per-class events,
+            sorted by descending score (see
+            :func:`build_mmdet_score_events`).
+        total_gt (dict[int, int]): per-class GT totals.
+        max_fdr (float): maximum allowed superclass mean FDR.
+
+    Returns:
+        dict with ``thresholds_by_super`` (ship/aircraft/vehicle →
+        threshold or ``None``), ``score_thresholds`` (25-value tuple, or
+        ``None`` when any superclass is unavailable), and ``metrics``
+        (the standard evaluation payload at the selected thresholds).
+    """
+    if not math.isfinite(max_fdr) or max_fdr < 0:
+        raise ValueError('max_fdr must be a finite non-negative number')
+    thresholds_by_super = {}
+    for super_name in SUPERCLASS_NAMES:
+        ids = SUPERCLASS_INDICES[super_name]
+        group_gt = sum(int(total_gt.get(i, 0)) for i in ids)
+        if group_gt == 0:
+            thresholds_by_super[super_name] = None
+            continue
+        # Sort defensively; producers already emit descending order.
+        sorted_events = {
+            cls_idx: sorted(events.get(cls_idx, []),
+                            key=lambda item: item[0], reverse=True)
+            for cls_idx in ids
+        }
+        group_scores = sorted(
+            {score for class_events in sorted_events.values()
+             for score, _ in class_events},
+            reverse=True)
+        if group_scores:
+            candidates = group_scores + [
+                group_scores[0] + max(abs(group_scores[0]) * 1e-12, 1e-12)]
+        else:
+            candidates = [1.0]
+        curves = _class_curves_by_score(sorted_events, ids)
+        best_key = None
+        best_threshold = None
+        for threshold in candidates:
+            recalls = []
+            fdrs = []
+            for cls_idx in ids:
+                tp, fp = curves[cls_idx].get(threshold, (0, 0))
+                class_gt = int(total_gt.get(cls_idx, 0))
+                recalls.append(tp / max(class_gt, 1))
+                fdrs.append(fp / max(fp + tp, 1))
+            super_recall = sum(recalls) / len(recalls)
+            super_fdr = sum(fdrs) / len(fdrs)
+            if super_fdr > max_fdr:
+                continue
+            key = (super_recall, -super_fdr, threshold)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_threshold = threshold
+        if best_threshold is None:
+            # The empty-prediction point always has FDR 0, so a group with
+            # GT can only land here if the caller passed a negative budget.
+            raise RuntimeError(
+                f'superclass {super_name!r} has GT but no feasible '
+                f'operating point under max_fdr={max_fdr}')
+        thresholds_by_super[super_name] = float(best_threshold)
+
+    unavailable = [name for name, value in thresholds_by_super.items()
+                   if value is None]
+    if unavailable:
+        # Diagnostic evaluation only: available groups run at their searched
+        # threshold, unavailable ones at the candidate floor. The official
+        # aggregate stays unavailable (NaN) so hooks refuse to save.
+        expanded_eval = tuple(
+            thresholds_by_super[_SUPERCLASS_OF_INDEX[cls_idx]]
+            if thresholds_by_super[_SUPERCLASS_OF_INDEX[cls_idx]] is not None
+            else CANDIDATE_SCORE_FLOOR
+            for cls_idx in range(len(CLASS_NAMES)))
+        score_thresholds = None
+    else:
+        expanded_eval = tuple(
+            thresholds_by_super[_SUPERCLASS_OF_INDEX[cls_idx]]
+            for cls_idx in range(len(CLASS_NAMES)))
+        score_thresholds = expanded_eval
+    metrics = evaluate_score_events(events, total_gt, expanded_eval)
+    return {
+        'thresholds_by_super': thresholds_by_super,
+        'score_thresholds': score_thresholds,
+        'metrics': metrics,
     }
 
 
@@ -399,12 +647,17 @@ def compare_official_candidates(candidate, best, recall_target=0.85,
 
 __all__ = [
     'CLASS_NAMES',
-    'CLASS_SCORE_THRESHOLDS',
+    'CANDIDATE_SCORE_FLOOR',
     'CLASS_IOU_THRESHOLDS',
     'SUPERCLASS_INDICES',
     'aggregate_official_per_class',
     'filter_mmdet_results',
     'evaluate_mmdet_results',
+    'evaluate_score_events',
+    'build_mmdet_score_events',
+    'match_class_events',
+    'normalize_score_thresholds',
+    'search_superclass_thresholds',
     'compare_official_candidates',
     'match_class',
 ]

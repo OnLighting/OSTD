@@ -1,30 +1,25 @@
 """Tests for the shared official Recall/FDR metric module.
 
-Covers constants, threshold filtering, one-to-one matching, superclass
-aggregation, merged counts, IoU per class, and the official model
-comparison used by checkpoint hooks.
+Covers constants, explicit-threshold filtering, one-to-one matching,
+superclass aggregation, merged counts, IoU per class, and the official
+model comparison used by checkpoint hooks. Score thresholds are always
+supplied by the caller — the module must never fall back to a built-in
+decision threshold.
 """
 
-import numpy as np
+import math
 
-from mmdet.core.evaluation.official_metrics import (
+import numpy as np
+import pytest
+
+from mmdet.core.evaluation import (
     CLASS_NAMES,
-    CLASS_SCORE_THRESHOLDS,
     CLASS_IOU_THRESHOLDS,
     SUPERCLASS_INDICES,
     compare_official_candidates,
     evaluate_mmdet_results,
     filter_mmdet_results,
 )
-
-
-EXPECTED_THRESHOLDS = (
-    .348537356, .00188686815, .00998581946, .0174246859,
-    .854384005, .554479778, .469661117, .424196422, .451967984,
-    .927510798, .927627504, .33063519, .791748285, .987444103,
-    .186482817, .69058013, .586889446, .936379254, .362753332,
-    .145738885, .877446949, .038396392, .141620845, .0739553422,
-    .0403826572)
 
 
 def _empty_result():
@@ -54,13 +49,8 @@ def _gt(bboxes, category_ids, image_ids=None):
     return out
 
 
-def test_hardcoded_thresholds_match_selected_csv_values():
-    assert CLASS_SCORE_THRESHOLDS == EXPECTED_THRESHOLDS
-
-
 def test_class_names_cover_categories_0_through_24():
     assert len(CLASS_NAMES) == 25
-    assert CLASS_SCORE_THRESHOLDS is not None and len(CLASS_SCORE_THRESHOLDS) == 25
     assert CLASS_IOU_THRESHOLDS is not None and len(CLASS_IOU_THRESHOLDS) == 25
     assert set(SUPERCLASS_INDICES.keys()) == {'ship', 'aircraft', 'vehicle'}
     seen = set()
@@ -76,20 +66,46 @@ def test_vehicle_class_uses_lower_iou():
         assert CLASS_IOU_THRESHOLDS[idx] == 0.5
 
 
-def test_filter_keeps_per_class_thresholds():
+def test_filter_uses_explicit_thresholds():
+    """Filtering must depend on the caller-supplied values, nothing else."""
     result = _empty_result()
-    result[0] = np.array([[0, 0, 2, 2, CLASS_SCORE_THRESHOLDS[0] - 1e-6]])
-    result[1] = np.array([[0, 0, 2, 2, CLASS_SCORE_THRESHOLDS[1]]])
-    filtered = filter_mmdet_results(result)
+    result[0] = np.array([[0, 0, 2, 2, 0.39]], dtype=np.float32)
+    result[1] = np.array([[0, 0, 2, 2, 0.40]], dtype=np.float32)
+    filtered = filter_mmdet_results(result, [0.40] * 25)
     assert len(filtered[0]) == 0
     assert len(filtered[1]) == 1
+
+
+def test_threshold_count_must_equal_class_count():
+    with pytest.raises(ValueError, match='25'):
+        filter_mmdet_results(_empty_result(), [0.1] * 24)
+
+
+def test_scalar_threshold_expands_to_every_class():
+    result = _empty_result()
+    result[3] = np.array([[0, 0, 2, 2, 0.19], [0, 0, 2, 2, 0.21]],
+                         dtype=np.float32)
+    filtered = filter_mmdet_results(result, 0.20)
+    assert len(filtered[3]) == 1
+    assert filtered[3][0][4] == pytest.approx(0.21)
+
+
+def test_negative_threshold_rejected():
+    with pytest.raises(ValueError, match='non-negative'):
+        filter_mmdet_results(_empty_result(), [-0.1] * 25)
+
+
+def test_result_class_count_must_match():
+    with pytest.raises(ValueError, match='25'):
+        filter_mmdet_results(_empty_result()[:24], [0.1] * 25)
 
 
 def test_duplicate_prediction_is_false_positive():
     """Two predictions covering the same GT: top score → TP, rest → FP."""
     result = _empty_result()
     result[0] = np.array([[0, 0, 10, 10, .9], [0, 0, 10, 10, .8]])
-    metrics = evaluate_mmdet_results([result], _gt([[[0, 0, 10, 10]]], [[0]]))
+    metrics = evaluate_mmdet_results([result], _gt([[[0, 0, 10, 10]]], [[0]]),
+                                     [0.0] * 25)
     assert metrics['per_class'][0]['tp'] == 1
     assert metrics['per_class'][0]['fp'] == 1
     assert metrics['per_class'][0]['fn'] == 0
@@ -97,8 +113,9 @@ def test_duplicate_prediction_is_false_positive():
 
 def test_score_below_threshold_is_false_positive_filtered():
     result = _empty_result()
-    result[0] = np.array([[0, 0, 10, 10, CLASS_SCORE_THRESHOLDS[0] - 1e-6]])
-    metrics = evaluate_mmdet_results([result], _gt([[[0, 0, 10, 10]]], [[0]]))
+    result[0] = np.array([[0, 0, 10, 10, 0.399]], dtype=np.float32)
+    metrics = evaluate_mmdet_results([result], _gt([[[0, 0, 10, 10]]], [[0]]),
+                                     [0.40] * 25)
     assert metrics['per_class'][0]['tp'] == 0
     assert metrics['per_class'][0]['fp'] == 0
     assert metrics['per_class'][0]['fn'] == 1
@@ -106,9 +123,8 @@ def test_score_below_threshold_is_false_positive_filtered():
 
 def test_no_predictions_no_gt_is_unavailable():
     """Empty val pool → no GT in any superclass → official unavailable."""
-    import math
     result = _empty_result()
-    metrics = evaluate_mmdet_results([result], _gt([[]], [[]]))
+    metrics = evaluate_mmdet_results([result], _gt([[]], [[]]), [0.0] * 25)
     assert metrics['official']['available'] is False
     assert math.isnan(metrics['official']['recall'])
     assert math.isnan(metrics['official']['fdr'])
@@ -124,18 +140,17 @@ def test_superclass_average_excludes_missing_class():
     # No aircraft GT, only ship GT.
     metrics = evaluate_mmdet_results(
         [result],
-        _gt([[[0, 0, 10, 10]]], [[0]]))  # single ship GT
+        _gt([[[0, 0, 10, 10]]], [[0]]),  # single ship GT
+        [0.0] * 25)
     assert metrics['by_super']['aircraft']['recall'] is None
     assert metrics['official']['available'] is False
     assert 'aircraft' in metrics['official']['unavailable_superclasses']
-    import math
     assert math.isnan(metrics['official']['recall'])
     assert math.isnan(metrics['official']['fdr'])
 
 
 def test_matcher_skips_already_matched_gt():
     """A prediction falls back to its best still-unmatched GT."""
-    import math
 
     result = _empty_result()
     # Both predictions are exact matches for GT-A. After the higher-scoring
@@ -147,7 +162,8 @@ def test_matcher_skips_already_matched_gt():
     ])
     metrics = evaluate_mmdet_results(
         [result],
-        _gt([[[0, 0, 10, 10], [3, 0, 10, 10]]], [[0, 0]]))
+        _gt([[[0, 0, 10, 10], [3, 0, 10, 10]]], [[0, 0]]),
+        [0.0] * 25)
     assert metrics['per_class'][0]['tp'] == 2
     assert metrics['per_class'][0]['fp'] == 0
     assert metrics['per_class'][0]['fn'] == 0
@@ -163,35 +179,32 @@ def test_official_unavailable_when_vehicle_missing():
     result[0] = np.array([[0, 0, 10, 10, .9]])
     metrics = evaluate_mmdet_results(
         [result],
-        _gt([[[0, 0, 10, 10]]], [[0]]))  # only ship GT
+        _gt([[[0, 0, 10, 10]]], [[0]]),  # only ship GT
+        [0.0] * 25)
     assert metrics['official']['available'] is False
     assert 'vehicle' in metrics['official']['unavailable_superclasses']
 
 
 def test_vehicle_iou_35_matches_lower_threshold():
-    """FSC IoU 0.35: a box with IoU 0.40 matches, IoU 0.30 does not."""
-    # GT box: 100x100 at origin → area 10000.
-    # Pred box: 80x80 at (10, 10) → area 6400, intersection 80*80=6400,
-    # union 10000+6400-6400=10000, IoU=0.64. We test instead the boundary
-    # at 0.35 by using non-symmetric GT.
+    """FSC IoU 0.35: a box with IoU 0.36 matches, IoU below 0.35 does not."""
     # GT box: (0,0,10,10) → 10x10.
-    # Pred box: (3,3,9,9) → 6x6 = 36, intersection (3,3,9,9)→ (3,3,9,9)=6*6=36,
+    # Pred box: (3,3,9,9) → 6x6 = 36, intersection (3,3,9,9)→6*6=36,
     # union = 100+36-36=100, IoU=0.36 (above 0.35).
     result = _empty_result()
     result[24] = np.array([[3, 3, 6, 6, .99]])
     metrics = evaluate_mmdet_results(
-        [result], _gt([[[0, 0, 10, 10]]], [[24]]))
+        [result], _gt([[[0, 0, 10, 10]]], [[24]]), [0.0] * 25)
     assert metrics['per_class'][24]['tp'] == 1
 
 
 def test_ship_iou_50_rejects_iou_just_below():
-    """Ship class requires IoU 0.50; a 0.40 IoU pred → FP."""
+    """Ship class requires IoU 0.50; a 0.49 IoU pred → FP."""
     # GT (0,0,10,10)=100, pred (2,2,9,9)=7*7=49, intersection
     # (2,2,9,9)→49, union=100+49-49=100, IoU=0.49 (below 0.50).
     result = _empty_result()
     result[0] = np.array([[2, 2, 7, 7, .99]])
     metrics = evaluate_mmdet_results(
-        [result], _gt([[[0, 0, 10, 10]]], [[0]]))
+        [result], _gt([[[0, 0, 10, 10]]], [[0]]), [0.0] * 25)
     assert metrics['per_class'][0]['tp'] == 0
     assert metrics['per_class'][0]['fp'] == 1
     assert metrics['per_class'][0]['fn'] == 1
@@ -206,7 +219,8 @@ def test_merged_counts_aggregate_all_classes():
     result[4] = np.array([[0, 20, 5, 5, .99]])
     metrics = evaluate_mmdet_results(
         [result],
-        _gt([[[0, 0, 5, 5], [0, 10, 5, 5], [0, 20, 5, 5]]], [[0, 0, 4]]))
+        _gt([[[0, 0, 5, 5], [0, 10, 5, 5], [0, 20, 5, 5]]], [[0, 0, 4]]),
+        [0.0] * 25)
     assert metrics['merged']['tp'] == 3
     assert metrics['merged']['fp'] == 1
     assert metrics['merged']['fn'] == 0
