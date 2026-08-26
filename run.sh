@@ -10,16 +10,18 @@
 #      choose best again on official val.
 #
 # After both stages, the script:
-#   - Runs a bbox evaluation on official val.
+#   - Runs standard COCO bbox mAP eval on the stage-2 best via
+#     tools/test.py (the official pipeline has no independent test split;
+#     data.test is an alias for data.val).
 #   - Exports fixed-threshold per-class val predictions.
 #   - Reports official Recall/FDR metrics on val.
 #   - Composes 10000x10000 mosaics from val.
 #   - Runs batched sliding-window inference on every mosaic.
-#   - Reports metrics and max inference time on mosaics.
+#   - Reports official metrics on mosaics and max inference time.
 #
-# All paths and ratios can be overridden via environment variables. The
-# script enforces `set -euo pipefail` so missing inputs/prior artifacts
-# abort immediately.
+# All paths, ratios, and the inference device can be overridden via
+# environment variables. The script enforces `set -euo pipefail` so missing
+# inputs/prior artifacts abort immediately.
 
 set -euo pipefail
 
@@ -37,6 +39,23 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${BIG_IMAGE_COUNT:=2}"
 : "${DEVICE:=cuda:0}"
 : "${NAMES:=HM,LQS,QHS,MS,A1_SU-35,A2_C-130,A3_C-17,A4_C-5,A5_F-16,A6_TU-160,A7_E-3,A8_B-52,A9_P-3C,A10_B-1B,A11_E-8,A12_TU-22,A13_F-15,A14_KC-135,A15_F-22,A16_FA-18,A17_TU-95,A18_KC-10,A19_SU-34,A20_SU-24,FSC}"
+
+# We always pass --cfg-options overrides so that DATA_ROOT and SHIPRS_ROOT
+# are honored without editing the config files. The CONFIG_*.py defaults
+# stay usable out of the box (./data, ./external_data/ShipRSImageNet).
+
+# build a path-prefixed value usable as DictAction input:
+#   $DATA_ROOT/annotations/instances_train.json — note that DictAction
+#   does NOT support trailing-slash-aware semantics, so the values must
+#   be plain strings without spaces.
+cfg_str() { printf '%s' "$1"; }
+
+OFFICIAL_TRAIN_ANN="$(cfg_str "$DATA_ROOT")/annotations/instances_train.json"
+OFFICIAL_TRAIN_IMG="$(cfg_str "$DATA_ROOT")/images/train/"
+OFFICIAL_VAL_ANN="$(cfg_str "$DATA_ROOT")/annotations/instances_val.json"
+OFFICIAL_VAL_IMG="$(cfg_str "$DATA_ROOT")/images/val/"
+SHIPRS_TRAIN_ANN="$(cfg_str "$DATA_ROOT")/external/shiprs_mapped_train.json"
+SHIPRS_IMG_PREFIX="$(cfg_str "$SHIPRS_ROOT")/"
 
 cd "$PROJECT_ROOT"
 
@@ -116,7 +135,14 @@ python tools/convert_yolo_to_coco.py --root "$DATA_ROOT" --split val \
 
 log "Stage 1: official-only training (best by official Recall/FDR)"
 mkdir -p "$OFFICIAL_WORK"
-python tools/train.py "$OFFICIAL_CONFIG" "$OFFICIAL_WORK"
+python tools/train.py "$OFFICIAL_CONFIG" "$OFFICIAL_WORK" \
+    --cfg-options \
+        data.train.dataset.ann_file="$OFFICIAL_TRAIN_ANN" \
+        data.train.dataset.img_prefix="$OFFICIAL_TRAIN_IMG" \
+        data.val.ann_file="$OFFICIAL_VAL_ANN" \
+        data.val.img_prefix="$OFFICIAL_VAL_IMG" \
+        data.test.ann_file="$OFFICIAL_VAL_ANN" \
+        data.test.img_prefix="$OFFICIAL_VAL_IMG"
 
 STAGE1_BEST="$OFFICIAL_WORK/best_official_recall_fdr.pth"
 require_file "$STAGE1_BEST"
@@ -129,24 +155,50 @@ log "Stage 1 best: $STAGE1_BEST"
 log "Preparing ShipRS mappings"
 require_dir "$SHIPRS_ROOT"
 python tools/prepare_shiprs.py --shiprs-root "$SHIPRS_ROOT" \
-    --out "$DATA_ROOT/external"
+    --out-json "$DATA_ROOT/external/shiprs_mapped_train.json" \
+    --audit-csv "$DATA_ROOT/external/shiprs_mapping_audit.csv" \
+    --summary-json "$DATA_ROOT/external/shiprs_summary.json"
 
 log "Stage 2: mixed fine-tune (load_from=$STAGE1_BEST, weights=$OFFICIAL_WEIGHT/$SHIPRS_WEIGHT)"
 mkdir -p "$FINETUNE_WORK"
 python tools/train.py "$FINETUNE_CONFIG" "$FINETUNE_WORK" \
-    --cfg-options load_from="$STAGE1_BEST" \
-        data.train.source_weights="($OFFICIAL_WEIGHT,$SHIPRS_WEIGHT)"
+    --cfg-options \
+        load_from="$STAGE1_BEST" \
+        data.train.source_weights="($OFFICIAL_WEIGHT,$SHIPRS_WEIGHT)" \
+        data.train.datasets.0.ann_file="$OFFICIAL_TRAIN_ANN" \
+        data.train.datasets.0.img_prefix="$OFFICIAL_TRAIN_IMG" \
+        data.train.datasets.1.ann_file="$SHIPRS_TRAIN_ANN" \
+        data.train.datasets.1.img_prefix="$SHIPRS_IMG_PREFIX" \
+        data.val.ann_file="$OFFICIAL_VAL_ANN" \
+        data.val.img_prefix="$OFFICIAL_VAL_IMG" \
+        data.test.ann_file="$OFFICIAL_VAL_ANN" \
+        data.test.img_prefix="$OFFICIAL_VAL_IMG"
 
 STAGE2_BEST="$FINETUNE_WORK/best_official_recall_fdr.pth"
 require_file "$STAGE2_BEST"
 log "Stage 2 best: $STAGE2_BEST"
 
 # ----------------------------------------------------------------------------
-# Stage 3: validation reporting (ordinary + big-image)
+# Stage 3: validation reporting (ordinary + bbox + big-image)
 # ----------------------------------------------------------------------------
 
 VAL_PRED="$FINETUNE_WORK/val_preds.json"
 VAL_METRICS_PREFIX="$FINETUNE_WORK/val_metrics"
+BBOX_JSON="$FINETUNE_WORK/bbox_metrics.json"
+
+log "Standard COCO bbox mAP eval on official val (data.test alias)"
+mkdir -p "$FINETUNE_WORK/bbox_eval"
+python tools/test.py "$OFFICIAL_CONFIG" "$STAGE2_BEST" \
+    "$FINETUNE_WORK/bbox_eval" \
+    --eval bbox \
+    --cfg-options \
+        data.test.ann_file="$OFFICIAL_VAL_ANN" \
+        data.test.img_prefix="$OFFICIAL_VAL_IMG"
+# tools/test.py writes <work_dir>/eval_<timestamp>.json — copy a stable alias.
+latest_eval=$(ls -t "$FINETUNE_WORK"/bbox_eval/eval_*.json 2>/dev/null | head -n 1 || true)
+if [ -n "${latest_eval:-}" ]; then
+    cp "$latest_eval" "$BBOX_JSON"
+fi
 
 log "Exporting val predictions with fixed per-class thresholds"
 python tools/eval_val_to_json.py \
@@ -154,7 +206,8 @@ python tools/eval_val_to_json.py \
     --checkpoint "$STAGE2_BEST" \
     --img-dir "$DATA_ROOT/images/val" \
     --gt "$DATA_ROOT/annotations/instances_val.json" \
-    --out "$VAL_PRED"
+    --out "$VAL_PRED" \
+    --device "$DEVICE"
 
 log "Reporting official Recall/FDR metrics on val"
 python tools/eval_recall_fdr.py \
@@ -200,10 +253,11 @@ log "Done."
 log "Artifacts:"
 log "  Stage 1 best:        $STAGE1_BEST (+ $OFFICIAL_WORK/best_official_recall_fdr.json)"
 log "  Stage 2 best:        $STAGE2_BEST (+ $FINETUNE_WORK/best_official_recall_fdr.json)"
+log "  COCO bbox (stage 2): $BBOX_JSON (latest eval JSON copied from $FINETUNE_WORK/bbox_eval/)"
 log "  Val predictions:     $VAL_PRED"
-log "  Val metrics:         ${VAL_METRICS_PREFIX}.{json,csv}"
+log "  Val official metrics:${VAL_METRICS_PREFIX}.{json,csv}"
 log "  Mosaic GT:           $BIG_VAL_GT"
 log "  Mosaic source map:   $BIG_VAL_MAP"
 log "  Mosaic predictions:  $BIG_VAL_PRED"
 log "  Mosaic timing:       $BIG_VAL_TIMING (max_inference_seconds)"
-log "  Mosaic metrics:      ${BIG_VAL_METRICS_PREFIX}.{json,csv}"
+log "  Mosaic official:     ${BIG_VAL_METRICS_PREFIX}.{json,csv}"
