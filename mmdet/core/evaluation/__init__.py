@@ -17,6 +17,8 @@ from .official_metrics import (CANDIDATE_SCORE_FLOOR, CLASS_IOU_THRESHOLDS,
                                match_class, match_class_events,
                                normalize_score_thresholds,
                                search_superclass_thresholds)
+from .threshold_artifact import (load_threshold_artifact, sha256_file,
+                                 write_threshold_artifact)
 
 __all__ = [
     'voc_classes', 'imagenet_det_classes', 'imagenet_vid_classes',
@@ -33,5 +35,6 @@ __all__ = [
     'match_class_events', 'normalize_score_thresholds',
     'search_superclass_thresholds',
     'aggregate_official_per_class', 'compare_official_candidates',
-    'match_class',
+    'match_class', 'load_threshold_artifact', 'sha256_file',
+    'write_threshold_artifact',
 ]
