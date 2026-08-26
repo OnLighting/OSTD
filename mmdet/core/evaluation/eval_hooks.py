@@ -1,4 +1,6 @@
 import json
+import math
+import os
 import os.path as osp
 import shutil
 
@@ -248,17 +250,28 @@ class OfficialBestSaverHook(Hook):
         metrics = runner.log_buffer.output
         if 'official_recall' not in metrics or 'official_fdr' not in metrics:
             return None
-        return {
-            'recall': float(metrics['official_recall']),
-            'fdr': float(metrics['official_fdr']),
-        }
+        recall = float(metrics['official_recall'])
+        fdr = float(metrics['official_fdr'])
+        # Any NaN here means the official aggregate is undefined — typically
+        # because one of ship / aircraft / vehicle had no GT in the val pool.
+        # Refuse to save so a missing-superclass epoch never silently beats a
+        # passing one.
+        if math.isnan(recall) or math.isnan(fdr):
+            return None
+        return {'recall': recall, 'fdr': fdr}
 
     def after_train_epoch(self, runner):
         candidate = self._candidate_payload(runner)
         if candidate is None:
-            runner.logger.warning(
-                'OfficialBestSaverHook: official_recall/official_fdr 未在验证'
-                '输出中找到，跳过 best 保存')
+            if ('official_recall' in runner.log_buffer.output
+                    and math.isnan(float(runner.log_buffer.output['official_recall']))):
+                runner.logger.warning(
+                    'OfficialBestSaverHook: 官方指标因某一大类缺少 GT 而不可计算'
+                    '，跳过本 epoch 的 best 保存')
+            else:
+                runner.logger.warning(
+                    'OfficialBestSaverHook: official_recall/official_fdr 未在验证'
+                    '输出中找到，跳过 best 保存')
             return
         if not compare_official_candidates(
                 candidate, self.best,
@@ -340,10 +353,31 @@ class OfficialEarlyStoppingHook(Hook):
         if ('official_recall' not in metrics
                 or 'official_fdr' not in metrics):
             return
-        candidate = {
-            'recall': float(metrics['official_recall']),
-            'fdr': float(metrics['official_fdr']),
-        }
+        recall = float(metrics['official_recall'])
+        fdr = float(metrics['official_fdr'])
+        # NaN means the official aggregate is undefined (e.g. missing GT in
+        # one of the three superclasses). Such an epoch must not be treated
+        # as a new best; the wait counter advances to keep early-stopping
+        # behaviour well-defined on degenerate val splits.
+        if math.isnan(recall) or math.isnan(fdr):
+            self.wait_count += 1
+            runner.logger.warning(
+                'OfficialEarlyStoppingHook: 官方指标因某一大类缺少 GT 而不可计算，'
+                f'本 epoch 不被接受，等待 {self.wait_count}/{self.patience}')
+            if self.wait_count >= self.patience:
+                self.stopped_epoch = runner.epoch
+                runner.should_stop = True
+                runner.logger.info(
+                    f'OfficialEarlyStoppingHook: 连续 {self.patience} 个 epoch '
+                    '官方指标不可计算，于 epoch '
+                    f'{runner.epoch + 1} 提前停止训练')
+                rank = _maybe_import_dist()
+                if rank == 0:
+                    raise EarlyStopping(
+                        runner.epoch, 'official_recall_fdr',
+                        self.best.get('recall', 0.0) if self.best else 0.0)
+            return
+        candidate = {'recall': recall, 'fdr': fdr}
         accepted = compare_official_candidates(
             candidate, self.best,
             recall_target=self.recall_target,

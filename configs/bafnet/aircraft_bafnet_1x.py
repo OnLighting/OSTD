@@ -226,9 +226,14 @@ model = dict(
             nms=dict(type='nms', iou_threshold=0.7),
             min_bbox_size=0),
         rcnn=dict(
-            score_thr=0.30,
+            # score_thr 设为 0.0 以保留所有候选；每类真实过滤由共享模块
+            # ``mmdet.core.evaluation.official_metrics.filter_mmdet_results``
+            # 完成（最小硬编码阈值为 0.0019，0.0 必然保留）。
+            score_thr=0.0,
             nms=dict(type='nms', iou_threshold=0.5),
-            max_per_img=300)))
+            # max_per_img 由 300 提到 3000，与 rpn_proposal 保持一致，避免在
+            # 低阈值（如 LQS/QHS）场景下提前截断 Recall。
+            max_per_img=3000)))
 
 # optimizer
 optimizer = dict(type='SGD', lr=0.005, momentum=0.9, weight_decay=0.0001)

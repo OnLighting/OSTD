@@ -120,6 +120,31 @@ class OfficialSaverHookTest(unittest.TestCase):
             meta = json.load(f)
         self.assertEqual(meta['epoch'], 2)
 
+    def test_nan_official_does_not_save_best(self):
+        """When the official aggregate is NaN (missing GT in a superclass),
+        the hook MUST NOT save the checkpoint or write the JSON metadata."""
+        import math
+        hook = OfficialBestSaverHook()
+        runner = _FakeRunner(
+            self.tmp, epoch=0,
+            metrics={'official_recall': float('nan'),
+                     'official_fdr': float('nan')})
+        hook.after_train_epoch(runner)
+        best_ckpt = os.path.join(self.tmp, 'best_official_recall_fdr.pth')
+        meta_path = os.path.join(self.tmp, 'best_official_recall_fdr.json')
+        self.assertFalse(os.path.exists(best_ckpt))
+        self.assertFalse(os.path.exists(meta_path))
+        # After a subsequent valid epoch, the best IS saved.
+        runner.log_buffer.output.update({'official_recall': .86,
+                                         'official_fdr': .19})
+        hook.after_train_epoch(runner)
+        self.assertTrue(os.path.exists(best_ckpt))
+        self.assertTrue(os.path.exists(meta_path))
+        with open(meta_path) as f:
+            meta = json.load(f)
+        self.assertTrue(math.isclose(meta['official_recall'], .86))
+        self.assertTrue(meta['passed'])
+
 
 class OfficialEarlyStoppingHookTest(unittest.TestCase):
 

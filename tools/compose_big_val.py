@@ -156,6 +156,13 @@ def compose_canvases(sources, sizes, placements, canvas_size=CANVAS_SIZE,
 def remap_annotations(gt, placements, per_canvas, canvas_size=CANVAS_SIZE):
     """Translate GT boxes to canvas coordinates.
 
+    Only annotations whose ``image_id`` is actually placed on one of the
+    selected canvases are translated; everything else is silently dropped.
+    The official pipeline does not require ``num_canvases`` to cover every
+    validation image — only ``num_canvases`` mosaics are produced, so GT
+    rows referring to images that didn't fit are legitimately absent from
+    the output.
+
     Returns (new_images, new_annotations). Image ids are regenerated.
     Categories are preserved from the input GT.
     """
@@ -183,8 +190,9 @@ def remap_annotations(gt, placements, per_canvas, canvas_size=CANVAS_SIZE):
     for ann in gt.get('annotations', []):
         offset = source_to_offset.get(int(ann['image_id']))
         if offset is None:
-            raise ValueError(
-                f'annotation image_id {ann["image_id"]} not present in mosaics')
+            # Source image was not placed on the selected canvases; skip
+            # its annotations rather than aborting the whole run.
+            continue
         canvas_idx, dx, dy = offset
         new_bbox = shift_bbox(list(ann['bbox']), dx, dy)
         x, y, bw, bh = new_bbox

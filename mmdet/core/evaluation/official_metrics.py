@@ -108,8 +108,11 @@ def _match_class(pred_boxes, pred_scores, gt_boxes, tau):
     """One-to-one matching for a single (image, class) pair.
 
     Predictions are processed in score-descending order. Each prediction
-    is greedily matched to the highest-IoU unmatched GT above ``tau``.
-    Unmatched predictions → FP, unmatched GT → FN.
+    is greedily matched to the highest-IoU **unmatched** GT above ``tau``.
+    Already-matched GTs are excluded from the candidate set so a prediction
+    whose highest-IoU GT is taken still has a chance to match a different
+    GT that crosses the threshold. Unmatched predictions → FP, unmatched
+    GT → FN.
     """
     n_gt = len(gt_boxes)
     n_p = len(pred_boxes)
@@ -126,9 +129,16 @@ def _match_class(pred_boxes, pred_scores, gt_boxes, tau):
         if n_gt == 0:
             break
         ious = _iou_xywh(b, gt_boxes)
-        best_gi = int(ious.argmax())
+        # Mask already-matched GTs before selecting the best. argmax on the
+        # full IoU vector would otherwise pick a taken GT and refuse the
+        # match even when a different unmatched GT still exceeds ``tau``.
+        masked = np.where(gt_matched, -1.0, ious)
+        best_gi = int(masked.argmax())
+        if gt_matched[best_gi]:
+            # All GTs are matched; remaining predictions are FP.
+            continue
         best_iou = float(ious[best_gi])
-        if best_iou >= tau and not gt_matched[best_gi]:
+        if best_iou >= tau:
             gt_matched[best_gi] = True
             pr_matched[pi] = True
     tp = int(pr_matched.sum())
@@ -191,10 +201,13 @@ def evaluate_mmdet_results(results, gt_infos):
 
     Returns:
         dict with keys ``per_class`` (list of dicts, one per category id 0..24),
-        ``by_super`` (dict ship/aircraft/vehicle → recall/fdr),
-        ``official`` (dict recall/fdr averaged across the superclasses that
-        have at least one GT), and ``merged`` (counts-based recall/fdr over
-        every category).
+        ``by_super`` (dict ship/aircraft/vehicle → recall/fdr; missing GTs
+        produce ``None`` values),
+        ``official`` (dict with ``recall``, ``fdr``, ``available`` boolean,
+        and ``unavailable_superclasses`` list — the recall/fdr are ``NaN``
+        when any of ship/aircraft/vehicle has no GT, so callers like the
+        checkpoint hook can refuse to use the run), and ``merged``
+        (counts-based recall/fdr over every category).
     """
     if len(results) != len(gt_infos):
         raise ValueError(
@@ -260,6 +273,7 @@ def evaluate_mmdet_results(results, gt_infos):
     by_super = {}
     official_recalls = []
     official_fdrs = []
+    unavailable_superclasses = []
     for super_name, ids in SUPERCLASS_INDICES.items():
         rs = [per_class_rows[i]['recall'] for i in ids]
         fs = [per_class_rows[i]['fdr'] for i in ids]
@@ -267,19 +281,31 @@ def evaluate_mmdet_results(results, gt_infos):
                        for i in ids)
         if gt_total == 0:
             by_super[super_name] = {'recall': None, 'fdr': None}
+            unavailable_superclasses.append(super_name)
             continue
         r = sum(rs) / len(rs)
         f = sum(fs) / len(fs)
         by_super[super_name] = {'recall': r, 'fdr': f}
         official_recalls.append(r)
         official_fdrs.append(f)
-    if official_recalls:
+    # Per the design doc: if ANY official superclass (ship / aircraft / vehicle)
+    # is missing GT, the official aggregate is undefined — return NaN so the
+    # checkpoint hook can refuse to use this epoch as best. Do not substitute
+    # zero (which would silently misrank a passing run).
+    if unavailable_superclasses or not official_recalls:
+        official = {
+            'recall': float('nan'),
+            'fdr': float('nan'),
+            'available': False,
+            'unavailable_superclasses': list(unavailable_superclasses),
+        }
+    else:
         official = {
             'recall': sum(official_recalls) / len(official_recalls),
             'fdr': sum(official_fdrs) / len(official_fdrs),
+            'available': True,
+            'unavailable_superclasses': [],
         }
-    else:
-        official = {'recall': 0.0, 'fdr': 0.0}
 
     overall_tp = sum(per_class_tp)
     overall_fp = sum(per_class_fp)

@@ -60,6 +60,78 @@ def test_no_oversize_sources_accepted():
         pack_images([(CANVAS_SIZE + 1, 1)], canvas_size=CANVAS_SIZE)
 
 
+def test_partial_canvas_drops_unplaced_annotations(tmp_path):
+    """When ``num_canvases`` is smaller than what fits all sources, only the
+    annotations that landed on a chosen canvas are translated. Inputs that
+    didn't fit are silently ignored (not raised as a ValueError)."""
+    import json
+
+    from tools import compose_big_val as mod
+
+    src_dir = tmp_path / 'src'
+    img_dir = src_dir / 'images'
+    img_dir.mkdir(parents=True)
+
+    # Three images: two fit comfortably; the third is too wide to share a
+    # canvas with them, so with num_canvases=1 only the first two land.
+    import cv2
+    sizes = [(5000, 1000), (5000, 1000), (9000, 9000)]
+    file_names = []
+    for i, (w, h) in enumerate(sizes):
+        arr = np.full((h, w, 3), 64, dtype=np.uint8)
+        cv2.imwrite(str(img_dir / f'src{i:02d}.jpg'), arr)
+        file_names.append(f'src{i:02d}.jpg')
+    gt_path = src_dir / 'gt.json'
+    images = [{'id': i + 1, 'file_name': fn, 'width': w, 'height': h}
+              for i, ((w, h), fn) in enumerate(zip(sizes, file_names))]
+    annotations = []
+    for i in range(3):
+        annotations.append({
+            'id': i + 1,
+            'image_id': i + 1,
+            'category_id': 4,
+            'bbox': [10, 10, 50, 50],
+            'area': 2500,
+            'iscrowd': 0,
+        })
+    with open(gt_path, 'w', encoding='utf-8') as f:
+        json.dump({'images': images, 'annotations': annotations,
+                   'categories': [{'id': 4, 'name': 'A1'}]}, f)
+
+    out_dir = tmp_path / 'out'
+    old_argv = __import__('sys').argv
+    __import__('sys').argv = [
+        'compose_big_val.py',
+        '--gt', str(gt_path),
+        '--img-dir', str(img_dir),
+        '--out-dir', str(out_dir),
+        '--num-canvases', '1',
+        '--seed', '0',
+    ]
+    try:
+        rc = mod.main()
+    finally:
+        __import__('sys').argv = old_argv
+    assert rc == 0
+    with open(out_dir / 'instances_big_val.json') as f:
+        new_gt = json.load(f)
+    # Only the sources that landed on canvas 0 contribute annotations. The
+    # 9000x9000 image is too large to coexist on the same canvas as the two
+    # 5000x1000 strips, so its annotation must be dropped silently.
+    placed_image_ids = {
+        entry['source_image_id']
+        for entry in json.loads((out_dir / 'source_map.json').read_text())
+    }
+    assert placed_image_ids <= {1, 2, 3}
+    expected_ann_count = len(placed_image_ids)
+    assert len(new_gt['annotations']) == expected_ann_count
+    for ann in new_gt['annotations']:
+        # All translated boxes must lie inside the 10000x10000 canvas.
+        x, y, bw, bh = ann['bbox']
+        assert 0 <= x and x + bw <= CANVAS_SIZE
+        assert 0 <= y and y + bh <= CANVAS_SIZE
+
+
 class ComposeCliTest(unittest.TestCase):
 
     def _make_fake_dataset(self, root):

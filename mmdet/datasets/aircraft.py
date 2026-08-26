@@ -72,13 +72,20 @@ class AircraftDataset(CocoDataset):
         flat_results = list(results)
         metrics = evaluate_mmdet_results(flat_results, gt_infos)
 
-        eval_results['official_recall'] = float(metrics['official']['recall'])
-        eval_results['official_fdr'] = float(metrics['official']['fdr'])
+        official = metrics['official']
+        # When any official superclass lacks GT, recall/fdr are NaN. Emit
+        # them as-is (Python NaN) so the checkpoint hook can detect
+        # ``math.isnan`` and refuse to save this run as best.
+        eval_results['official_recall'] = official['recall']
+        eval_results['official_fdr'] = official['fdr']
+        eval_results['official_available'] = bool(official['available'])
+        eval_results['official_unavailable_superclasses'] = list(
+            official['unavailable_superclasses'])
         for super_name, vals in metrics['by_super'].items():
             eval_results[f'{super_name}_recall'] = (
-                float(vals['recall']) if vals['recall'] is not None else 0.0)
+                float(vals['recall']) if vals['recall'] is not None else float('nan'))
             eval_results[f'{super_name}_fdr'] = (
-                float(vals['fdr']) if vals['fdr'] is not None else 0.0)
+                float(vals['fdr']) if vals['fdr'] is not None else float('nan'))
         eval_results['merged_recall'] = float(metrics['merged']['recall'])
         eval_results['merged_fdr'] = float(metrics['merged']['fdr'])
         # Per-class breakdown (compact, used by hooks that want to log it).
