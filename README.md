@@ -4,7 +4,8 @@ This repository trains a 25-class optical-satellite aircraft/vehicle
 detector (BAFNet on mmdetection 2.x) and reports metrics in the format
 required by the official competition. The pipeline uses an **8:2
 train/val split**, **two-stage training** (official → mixed official +
-ShipRS fine-tune), adaptive validation-time score calibration, and
+ShipRS fine-tune), fixed-score training validation followed by one final
+adaptive score calibration, and
 **max-inference-time** reporting on simulated 10 000 × 10 000 mosaics.
 
 ## Quick start
@@ -39,8 +40,9 @@ bash run.sh
 * Converts YOLO labels to COCO JSON (`tools/convert_yolo_to_coco.py`).
 * Trains `aircraft_bafnet_1x.py` from scratch.
 * Chooses the best checkpoint on the 20% val pool using the official
-  Recall/FDR protocol (`OfficialBestSaverHook`). Each validation epoch
-  searches one exact score threshold for ship, aircraft, and vehicle.
+  Recall/FDR protocol (`OfficialBestSaverHook`). Every validation epoch uses
+  the same score threshold, `0.30`, for all 25 classes; no threshold search
+  runs during training.
 * Best is saved to `work_dirs/official_stage/best_official_recall_fdr.pth`.
 
 ### Stage 2 — mixed official + ShipRS fine-tune
@@ -71,8 +73,8 @@ bash run.sh
 ## Official metric definitions
 
 * Per-class IoU: 0.50 for ship/aircraft, 0.35 for FSC (vehicle).
-* Training-time validation searches one exact threshold per superclass,
-  with each superclass mean FDR constrained to 0.19.
+* Training-time validation uses one fixed score threshold, `0.30`, for all
+  classes so every epoch is compared under the same operating point.
 * After stage 2, validation predictions are searched once for 25 final
   thresholds. `final_thresholds.json` is then reused unchanged for ordinary
   validation, simulated 10k images, and the independent official test set.

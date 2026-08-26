@@ -1,4 +1,4 @@
-"""Tests for the exact per-superclass training-time threshold search.
+"""Tests for the optional exact per-superclass diagnostic search.
 
 The production mutation caught by this file is using one global threshold
 or a hand-written grid instead of distinct exact score breakpoints per

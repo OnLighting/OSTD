@@ -16,8 +16,7 @@ def _results_with_all_superclasses():
     return [per_class]
 
 
-def test_dataset_evaluate_searches_and_emits_superclass_thresholds(
-        monkeypatch):
+def test_dataset_evaluate_uses_fixed_training_threshold(monkeypatch):
     dataset = object.__new__(AircraftDataset)
     dataset.cat2label = {category_id: category_id for category_id in range(25)}
     monkeypatch.setattr(
@@ -39,11 +38,14 @@ def test_dataset_evaluate_searches_and_emits_superclass_thresholds(
         _results_with_all_superclasses(), metric=['official'])
 
     assert metrics['training_score_thresholds'] == {
-        'ship': 0.91,
-        'aircraft': 0.61,
-        'vehicle': 0.21,
+        'ship': 0.30,
+        'aircraft': 0.30,
+        'vehicle': 0.30,
     }
-    assert metrics['official_threshold_ship'] == 0.91
-    assert metrics['official_threshold_aircraft'] == 0.61
-    assert metrics['official_threshold_vehicle'] == 0.21
-    assert metrics['official_fdr'] <= 0.19
+    assert metrics['official_threshold_ship'] == 0.30
+    assert metrics['official_threshold_aircraft'] == 0.30
+    assert metrics['official_threshold_vehicle'] == 0.30
+    # The 0.21 vehicle detection is deliberately rejected. If per-epoch
+    # threshold search returns, this becomes a TP and the test fails.
+    assert metrics['official_per_class'][24]['tp'] == 0
+    assert metrics['official_per_class'][24]['fn'] == 1

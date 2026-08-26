@@ -1,8 +1,10 @@
 from .coco import CocoDataset
 from .builder import DATASETS
 
-from mmdet.core.evaluation import (build_mmdet_score_events,
-                                   search_superclass_thresholds)
+from mmdet.core.evaluation import (CANDIDATE_SCORE_FLOOR,
+                                   evaluate_mmdet_results,
+                                   filter_mmdet_results,
+                                   normalize_score_thresholds)
 
 
 @DATASETS.register_module()
@@ -15,7 +17,9 @@ class AircraftDataset(CocoDataset):
 
     When ``evaluate`` is called with ``metric`` containing ``'official'``,
     the dataset writes per-class, superclass, official, and merged metrics
-    using the shared ``mmdet.core.evaluation.official_metrics`` module.
+    using the shared ``mmdet.core.evaluation.official_metrics`` module at one
+    fixed training threshold (default ``0.30``). Threshold calibration never
+    runs inside training evaluation.
     Stable scalar keys (``official_recall``, ``official_fdr``,
     ``ship_recall``, ``ship_fdr``, ...) are emitted so EvalHook consumers
     can read them without parsing nested dicts.
@@ -28,6 +32,15 @@ class AircraftDataset(CocoDataset):
         'A13_F-15', 'A14_KC-135', 'A15_F-22', 'A16_FA-18', 'A17_TU-95',
         'A18_KC-10', 'A19_SU-34', 'A20_SU-24', 'FSC',
     )
+    OFFICIAL_SCORE_THRESHOLD = 0.30
+
+    def __init__(self, *args, official_score_threshold=0.30, **kwargs):
+        thresholds = normalize_score_thresholds(official_score_threshold)
+        if len(set(thresholds)) != 1:
+            raise ValueError(
+                'training official_score_threshold must be one scalar')
+        self.official_score_threshold = thresholds[0]
+        super().__init__(*args, **kwargs)
 
     def evaluate(self, results, metric=['bbox', 'official'], **kwargs):
         """Run standard COCO and official metrics when requested.
@@ -70,12 +83,22 @@ class AircraftDataset(CocoDataset):
                     'category_id': int(label2cat[int(label)]),
                 })
             gt_infos.append(anns)
-        flat_results = list(results)
-        events, total_gt = build_mmdet_score_events(flat_results, gt_infos)
-        searched = search_superclass_thresholds(
-            events, total_gt, max_fdr=0.19)
-        metrics = searched['metrics']
-        thresholds_by_super = searched['thresholds_by_super']
+        threshold = float(getattr(
+            self, 'official_score_threshold', self.OFFICIAL_SCORE_THRESHOLD))
+        # Filter before matching so low-score candidates do not consume CPU
+        # during every training validation epoch. Final 25-class calibration
+        # remains a separate, one-time post-training step in run.sh.
+        filtered_results = [
+            filter_mmdet_results(image_results, threshold)
+            for image_results in results
+        ]
+        metrics = evaluate_mmdet_results(
+            filtered_results, gt_infos, CANDIDATE_SCORE_FLOOR)
+        thresholds_by_super = {
+            'ship': threshold,
+            'aircraft': threshold,
+            'vehicle': threshold,
+        }
 
         official = metrics['official']
         # When any official superclass lacks GT, recall/fdr are NaN. Emit

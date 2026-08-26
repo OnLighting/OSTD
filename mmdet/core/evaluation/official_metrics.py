@@ -11,12 +11,12 @@ official metrics. It is consumed by:
 
 It exposes the candidate score floor, per-class IoU thresholds, the
 superclass (ship/aircraft/vehicle) grouping, score-ranked matching
-events, explicit-threshold filtering/evaluation, the training-time
+events, explicit-threshold filtering/evaluation, an optional diagnostic
 per-superclass threshold search, the official/merged aggregation, and
 the comparator used by checkpoint hooks to choose the best model.
 
 Decision thresholds are **never** built in: every consumer must supply
-them explicitly (from the training-time search or the frozen checkpoint-
+them explicitly (from the fixed training threshold or the frozen checkpoint-
 bound artifact). The only module-level score constant is
 ``CANDIDATE_SCORE_FLOOR``, which keeps model-side candidates alive
 before a decision threshold exists; it is not a decision threshold.
@@ -471,7 +471,11 @@ def evaluate_mmdet_results(results, gt_infos, score_thresholds):
 
 
 def search_superclass_thresholds(events, total_gt, max_fdr=0.19):
-    """Search one exact operating threshold per superclass for training.
+    """Search one exact operating threshold per superclass for diagnostics.
+
+    The training pipeline does not call this function: every epoch is
+    evaluated at the fixed dataset threshold. Final 25-class calibration is
+    performed once by ``tools/search_recall_fdr_thresholds.py``.
 
     For each superclass, candidate thresholds are every distinct event
     score in that superclass plus an empty-prediction threshold above its
