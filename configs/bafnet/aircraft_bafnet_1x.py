@@ -241,3 +241,8 @@ lr_config = dict(
     step=[56, 70])
 
 runner = dict(type='EpochBasedRunner', max_epochs=100)
+
+# 训练期 EvalHook 同时计算 bbox（COCO mAP，用于诊断）和 official
+# （官方 Recall/FDR，用于 best 选择与早停）。详见
+# mmdet/core/evaluation/official_metrics.py。
+evaluation = dict(interval=1, metric=['bbox', 'official'])

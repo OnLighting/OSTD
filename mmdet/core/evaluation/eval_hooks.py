@@ -1,3 +1,4 @@
+import json
 import os.path as osp
 import shutil
 
@@ -6,6 +7,8 @@ from mmcv.runner import DistEvalHook as BaseDistEvalHook
 from mmcv.runner import EvalHook as BaseEvalHook
 from mmcv.runner import HOOKS, Hook
 from torch.nn.modules.batchnorm import _BatchNorm
+
+from .official_metrics import compare_official_candidates
 
 
 class EarlyStopping(Exception):
@@ -187,4 +190,191 @@ class BestSaverHook(Hook):
             f'BestSaverHook: {self.monitor}={current:.4f} 创新高，'
             f'已保存 best 模型 -> {out}')
 
+
+def _maybe_import_dist():
+    """Helper for hooks that may run inside a DDP context."""
+    try:
+        import torch.distributed as _dist
+        if _dist.is_available() and _dist.is_initialized():
+            return _dist.get_rank()
+    except Exception:
+        pass
+    return 0
+
+
+@HOOKS.register_module()
+class OfficialBestSaverHook(Hook):
+    """按官方 Recall/FDR 选择 best checkpoint。
+
+    从 ``runner.log_buffer.output`` 读取 ``official_recall`` 和
+    ``official_fdr``（由 ``AircraftDataset.evaluate`` 在请求 ``official``
+    metric 时写入），依据 ``compare_official_candidates`` 的六规则比较。
+    通过则复制当前 epoch checkpoint 为 ``best_official_recall_fdr.pth``，
+    并以原子方式写 ``best_official_recall_fdr.json`` 元数据。
+
+    Args:
+        recall_target (float): Recall 通过门槛，默认 0.85。
+        fdr_limit (float): FDR 通过上限，默认 0.20。
+        recall_tolerance (float): 双达标后的 Recall tiebreak 容差，默认
+            0.005。
+        ckpt_filename (str): 当前 epoch checkpoint 文件名模板（与
+            CheckpointHook 一致），默认 ``epoch_{epoch}.pth``。
+        save_filename (str): best checkpoint 文件名，
+            默认 ``best_official_recall_fdr.pth``。
+        meta_filename (str): best 元数据文件名，
+            默认 ``best_official_recall_fdr.json``。
+    """
+
+    def __init__(self,
+                 recall_target=0.85,
+                 fdr_limit=0.20,
+                 recall_tolerance=0.005,
+                 ckpt_filename='epoch_{epoch}.pth',
+                 save_filename='best_official_recall_fdr.pth',
+                 meta_filename='best_official_recall_fdr.json'):
+        super().__init__()
+        self.recall_target = recall_target
+        self.fdr_limit = fdr_limit
+        self.recall_tolerance = recall_tolerance
+        self.ckpt_filename = ckpt_filename
+        self.save_filename = save_filename
+        self.meta_filename = meta_filename
+        # In-memory mirror of the on-disk best; avoids re-reading JSON each
+        # epoch.
+        self.best = None
+        self.best_path = None
+
+    def _candidate_payload(self, runner):
+        metrics = runner.log_buffer.output
+        if 'official_recall' not in metrics or 'official_fdr' not in metrics:
+            return None
+        return {
+            'recall': float(metrics['official_recall']),
+            'fdr': float(metrics['official_fdr']),
+        }
+
+    def after_train_epoch(self, runner):
+        candidate = self._candidate_payload(runner)
+        if candidate is None:
+            runner.logger.warning(
+                'OfficialBestSaverHook: official_recall/official_fdr 未在验证'
+                '输出中找到，跳过 best 保存')
+            return
+        if not compare_official_candidates(
+                candidate, self.best,
+                recall_target=self.recall_target,
+                fdr_limit=self.fdr_limit,
+                recall_tolerance=self.recall_tolerance):
+            return
+        # 找当前 epoch 的 latest checkpoint（CheckpointHook 在本 hook 之前
+        # 已保存 epoch_{epoch+1}.pth）。
+        ckpt = osp.join(
+            runner.work_dir,
+            self.ckpt_filename.format(epoch=runner.epoch + 1))
+        if not osp.exists(ckpt):
+            runner.logger.warning(
+                f'OfficialBestSaverHook: latest checkpoint {ckpt} 不存在，'
+                '跳过复制')
+            return
+        out_ckpt = osp.join(runner.work_dir, self.save_filename)
+        out_meta = osp.join(runner.work_dir, self.meta_filename)
+        shutil.copy(ckpt, out_ckpt)
+        passed = (
+            candidate['recall'] >= self.recall_target
+            and candidate['fdr'] <= self.fdr_limit)
+        meta = {
+            'epoch': runner.epoch + 1,
+            'official_recall': candidate['recall'],
+            'official_fdr': candidate['fdr'],
+            'passed': bool(passed),
+            'recall_target': self.recall_target,
+            'fdr_limit': self.fdr_limit,
+            'recall_tolerance': self.recall_tolerance,
+        }
+        tmp_meta = out_meta + '.tmp'
+        with open(tmp_meta, 'w', encoding='utf-8') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_meta, out_meta)
+        self.best = candidate
+        self.best_path = out_ckpt
+        runner.logger.info(
+            f'OfficialBestSaverHook: official_recall='
+            f'{candidate["recall"]:.4f} official_fdr='
+            f'{candidate["fdr"]:.4f} passed={passed}，'
+            f'已保存 best -> {out_ckpt}')
+
+
+@HOOKS.register_module()
+class OfficialEarlyStoppingHook(Hook):
+    """按官方 Recall/FDR 比较策略实现的早停 hook。
+
+    与 ``EarlyStoppingHook`` 不同：当候选指标未被
+    ``compare_official_candidates`` 接受时耐心计数才会增长，被接受时立刻
+    重置。``patience`` 个连续未接受的 epoch 后抛出 ``EarlyStopping``，
+    由 ``tools/train.py`` 捕获并优雅退出。
+
+    Args:
+        patience (int): 容忍多少个连续未接受 epoch，默认 16。
+        recall_target (float): Recall 通过门槛，默认 0.85。
+        fdr_limit (float): FDR 通过上限，默认 0.20。
+        recall_tolerance (float): 双达标后 Recall tiebreak 容差，默认
+            0.005。
+    """
+
+    def __init__(self,
+                 patience=16,
+                 recall_target=0.85,
+                 fdr_limit=0.20,
+                 recall_tolerance=0.005):
+        super().__init__()
+        self.patience = patience
+        self.recall_target = recall_target
+        self.fdr_limit = fdr_limit
+        self.recall_tolerance = recall_tolerance
+        self.best = None
+        self.wait_count = 0
+        self.stopped_epoch = 0
+
+    def after_train_epoch(self, runner):
+        metrics = runner.log_buffer.output
+        if ('official_recall' not in metrics
+                or 'official_fdr' not in metrics):
+            return
+        candidate = {
+            'recall': float(metrics['official_recall']),
+            'fdr': float(metrics['official_fdr']),
+        }
+        accepted = compare_official_candidates(
+            candidate, self.best,
+            recall_target=self.recall_target,
+            fdr_limit=self.fdr_limit,
+            recall_tolerance=self.recall_tolerance)
+        if accepted:
+            self.best = candidate
+            self.wait_count = 0
+            return
+        # 首个 epoch 也会被算作一次"接受"（best 从 None 变为候选），
+        # 因此 wait_count 只在真正被拒绝的 epoch 才增长。
+        if self.best is None:
+            self.best = candidate
+            self.wait_count = 0
+            return
+        self.wait_count += 1
+        runner.logger.info(
+            f'OfficialEarlyStoppingHook: official_recall='
+            f'{candidate["recall"]:.4f} official_fdr='
+            f'{candidate["fdr"]:.4f} 未超越当前最佳，'
+            f'等待 {self.wait_count}/{self.patience}')
+        if self.wait_count >= self.patience:
+            self.stopped_epoch = runner.epoch
+            runner.should_stop = True
+            runner.logger.info(
+                f'OfficialEarlyStoppingHook: 连续 {self.patience} 个 epoch '
+                f'官方指标无提升，于 epoch {runner.epoch + 1} 提前停止训练')
+            rank = _maybe_import_dist()
+            if rank == 0:
+                raise EarlyStopping(runner.epoch,
+                                    'official_recall_fdr',
+                                    self.best.get('recall', 0.0)
+                                    if self.best else 0.0)
 
