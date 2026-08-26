@@ -256,22 +256,36 @@ class OfficialBestSaverHook(Hook):
         # because one of ship / aircraft / vehicle had no GT in the val pool.
         # Refuse to save so a missing-superclass epoch never silently beats a
         # passing one.
-        if math.isnan(recall) or math.isnan(fdr):
+        if not math.isfinite(recall) or not math.isfinite(fdr):
             return None
-        return {'recall': recall, 'fdr': fdr}
+        threshold_keys = {
+            'ship': 'official_threshold_ship',
+            'aircraft': 'official_threshold_aircraft',
+            'vehicle': 'official_threshold_vehicle',
+        }
+        if any(key not in metrics for key in threshold_keys.values()):
+            return None
+        thresholds = {
+            name: float(metrics[key]) for name, key in threshold_keys.items()
+        }
+        if any(not math.isfinite(value) or value < 0
+               for value in thresholds.values()):
+            return None
+        return {'recall': recall, 'fdr': fdr, 'thresholds': thresholds}
 
     def after_train_epoch(self, runner):
         candidate = self._candidate_payload(runner)
         if candidate is None:
             if ('official_recall' in runner.log_buffer.output
-                    and math.isnan(float(runner.log_buffer.output['official_recall']))):
+                    and not math.isfinite(float(
+                        runner.log_buffer.output['official_recall']))):
                 runner.logger.warning(
                     'OfficialBestSaverHook: 官方指标因某一大类缺少 GT 而不可计算'
                     '，跳过本 epoch 的 best 保存')
             else:
                 runner.logger.warning(
-                    'OfficialBestSaverHook: official_recall/official_fdr 未在验证'
-                    '输出中找到，跳过 best 保存')
+                    'OfficialBestSaverHook: official 指标或三大类训练阈值缺失/'
+                    '非法，跳过 best 保存')
             return
         if not compare_official_candidates(
                 candidate, self.best,
@@ -303,12 +317,16 @@ class OfficialBestSaverHook(Hook):
             'recall_target': self.recall_target,
             'fdr_limit': self.fdr_limit,
             'recall_tolerance': self.recall_tolerance,
+            'training_score_thresholds': dict(candidate['thresholds']),
         }
         tmp_meta = out_meta + '.tmp'
         with open(tmp_meta, 'w', encoding='utf-8') as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         os.replace(tmp_meta, out_meta)
-        self.best = candidate
+        self.best = {
+            'recall': candidate['recall'],
+            'fdr': candidate['fdr'],
+        }
         self.best_path = out_ckpt
         runner.logger.info(
             f'OfficialBestSaverHook: official_recall='

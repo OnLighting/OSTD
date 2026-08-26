@@ -66,7 +66,13 @@ class OfficialSaverHookTest(unittest.TestCase):
     def _make_runner(self, epoch, recall, fdr):
         return _FakeRunner(
             self.tmp, epoch=epoch,
-            metrics={'official_recall': recall, 'official_fdr': fdr})
+            metrics={
+                'official_recall': recall,
+                'official_fdr': fdr,
+                'official_threshold_ship': .31,
+                'official_threshold_aircraft': .42,
+                'official_threshold_vehicle': .17,
+            })
 
     def test_no_double_pass_first_epoch_is_best(self):
         hook = OfficialBestSaverHook()
@@ -82,6 +88,24 @@ class OfficialSaverHookTest(unittest.TestCase):
         self.assertAlmostEqual(meta['official_recall'], .80, places=6)
         self.assertAlmostEqual(meta['official_fdr'], .15, places=6)
         self.assertFalse(meta['passed'])
+        self.assertEqual(meta['training_score_thresholds'], {
+            'ship': .31,
+            'aircraft': .42,
+            'vehicle': .17,
+        })
+
+    def test_missing_training_threshold_refuses_to_save(self):
+        hook = OfficialBestSaverHook()
+        runner = _FakeRunner(
+            self.tmp, epoch=0,
+            metrics={'official_recall': .86, 'official_fdr': .19})
+
+        hook.after_train_epoch(runner)
+
+        self.assertFalse(os.path.exists(os.path.join(
+            self.tmp, 'best_official_recall_fdr.pth')))
+        self.assertFalse(os.path.exists(os.path.join(
+            self.tmp, 'best_official_recall_fdr.json')))
 
     def test_double_pass_replaces_non_double_pass(self):
         hook = OfficialBestSaverHook()
@@ -136,7 +160,10 @@ class OfficialSaverHookTest(unittest.TestCase):
         self.assertFalse(os.path.exists(meta_path))
         # After a subsequent valid epoch, the best IS saved.
         runner.log_buffer.output.update({'official_recall': .86,
-                                         'official_fdr': .19})
+                                         'official_fdr': .19,
+                                         'official_threshold_ship': .31,
+                                         'official_threshold_aircraft': .42,
+                                         'official_threshold_vehicle': .17})
         hook.after_train_epoch(runner)
         self.assertTrue(os.path.exists(best_ckpt))
         self.assertTrue(os.path.exists(meta_path))

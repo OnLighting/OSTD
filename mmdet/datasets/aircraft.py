@@ -1,7 +1,8 @@
 from .coco import CocoDataset
 from .builder import DATASETS
 
-from mmdet.core.evaluation import evaluate_mmdet_results
+from mmdet.core.evaluation import (build_mmdet_score_events,
+                                   search_superclass_thresholds)
 
 
 @DATASETS.register_module()
@@ -70,7 +71,11 @@ class AircraftDataset(CocoDataset):
                 })
             gt_infos.append(anns)
         flat_results = list(results)
-        metrics = evaluate_mmdet_results(flat_results, gt_infos)
+        events, total_gt = build_mmdet_score_events(flat_results, gt_infos)
+        searched = search_superclass_thresholds(
+            events, total_gt, max_fdr=0.19)
+        metrics = searched['metrics']
+        thresholds_by_super = searched['thresholds_by_super']
 
         official = metrics['official']
         # When any official superclass lacks GT, recall/fdr are NaN. Emit
@@ -81,6 +86,12 @@ class AircraftDataset(CocoDataset):
         eval_results['official_available'] = bool(official['available'])
         eval_results['official_unavailable_superclasses'] = list(
             official['unavailable_superclasses'])
+        eval_results['training_score_thresholds'] = dict(
+            thresholds_by_super)
+        for super_name, threshold in thresholds_by_super.items():
+            eval_results[f'official_threshold_{super_name}'] = (
+                float(threshold)
+                if threshold is not None else float('nan'))
         for super_name, vals in metrics['by_super'].items():
             eval_results[f'{super_name}_recall'] = (
                 float(vals['recall']) if vals['recall'] is not None else float('nan'))
