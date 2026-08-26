@@ -8,6 +8,7 @@ superclass.
 import pytest
 
 from mmdet.core.evaluation import search_superclass_thresholds
+from mmdet.core.evaluation import official_metrics
 
 
 def _events_with_all_superclasses():
@@ -176,3 +177,33 @@ def test_search_returns_metrics_matching_evaluation_shape():
     assert metrics['official']['recall'] == \
         pytest.approx((0.25 + 0.05 + 1.0) / 3)
     assert metrics['by_super']['ship']['recall'] == pytest.approx(0.25)
+
+
+def test_search_does_not_rescan_every_class_for_every_candidate(monkeypatch):
+    """Exact-score search must stay linear instead of candidate×prediction.
+
+    The final metrics calculation needs one count pass for each of the 25
+    classes. Reusing that full scan for every candidate score caused epoch-end
+    validation to remain CPU-bound for tens of minutes on dense predictions.
+    """
+    events, total_gt = _events_with_all_superclasses()
+    events[0] = [
+        (1.0 - index / 1000.0, 1 if index == 0 else 0)
+        for index in range(100)
+    ]
+    original = official_metrics._per_class_counts_at_threshold
+    call_count = 0
+
+    def counted(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        official_metrics, '_per_class_counts_at_threshold', counted)
+
+    result = official_metrics.search_superclass_thresholds(
+        events, total_gt, max_fdr=0.19)
+
+    assert result['thresholds_by_super']['ship'] == 1.0
+    assert call_count == 25

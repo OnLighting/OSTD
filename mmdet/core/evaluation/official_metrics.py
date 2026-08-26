@@ -24,6 +24,7 @@ before a decision threshold exists; it is not a decision threshold.
 
 import math
 from collections import defaultdict
+from heapq import heappop, heappush
 
 import numpy as np
 
@@ -512,34 +513,68 @@ def search_superclass_thresholds(events, total_gt, max_fdr=0.19):
                             key=lambda item: item[0], reverse=True)
             for cls_idx in ids
         }
-        group_scores = sorted(
-            {score for class_events in sorted_events.values()
-             for score, _ in class_events},
-            reverse=True)
-        if group_scores:
-            candidates = group_scores + [
-                group_scores[0] + max(abs(group_scores[0]) * 1e-12, 1e-12)]
+        # Sweep all child-class events once in global score order. The old
+        # implementation rescanned every prediction in every child class for
+        # every distinct candidate score (quadratic on dense validation
+        # output), leaving the GPU idle for tens of minutes after COCO eval.
+        heap = []
+        for cls_idx in ids:
+            class_events = sorted_events[cls_idx]
+            if class_events:
+                score, flag = class_events[0]
+                heappush(heap, (-score, cls_idx, 0, flag))
+
+        if heap:
+            max_score = -heap[0][0]
+            empty_threshold = max_score + max(
+                abs(max_score) * 1e-12, 1e-12)
         else:
-            candidates = [1.0]
-        best_key = None
-        best_threshold = None
-        for threshold in candidates:
-            recalls = []
-            fdrs = []
-            for cls_idx in ids:
+            empty_threshold = 1.0
+        best_key = (0.0, -0.0, empty_threshold)
+        best_threshold = empty_threshold
+        per_class_tp = {cls_idx: 0 for cls_idx in ids}
+        per_class_fp = {cls_idx: 0 for cls_idx in ids}
+        recall_sum = 0.0
+        fdr_sum = 0.0
+
+        while heap:
+            threshold = -heap[0][0]
+            old_contributions = {}
+            while heap and -heap[0][0] == threshold:
+                _, cls_idx, event_index, flag = heappop(heap)
+                if cls_idx not in old_contributions:
+                    class_gt = int(total_gt.get(cls_idx, 0))
+                    tp = per_class_tp[cls_idx]
+                    fp = per_class_fp[cls_idx]
+                    old_contributions[cls_idx] = (
+                        tp / max(class_gt, 1),
+                        fp / max(tp + fp, 1),
+                    )
+                if flag:
+                    per_class_tp[cls_idx] += 1
+                else:
+                    per_class_fp[cls_idx] += 1
+                next_index = event_index + 1
+                class_events = sorted_events[cls_idx]
+                if next_index < len(class_events):
+                    score, next_flag = class_events[next_index]
+                    heappush(
+                        heap, (-score, cls_idx, next_index, next_flag))
+
+            for cls_idx, (old_recall, old_fdr) in \
+                    old_contributions.items():
                 class_gt = int(total_gt.get(cls_idx, 0))
-                tp, fp, _ = _per_class_counts_at_threshold(
-                    sorted_events[cls_idx], class_gt, threshold)
-                recalls.append(tp / max(class_gt, 1))
-                fdrs.append(fp / max(fp + tp, 1))
-            super_recall = sum(recalls) / len(recalls)
-            super_fdr = sum(fdrs) / len(fdrs)
-            if super_fdr > max_fdr:
-                continue
-            key = (super_recall, -super_fdr, threshold)
-            if best_key is None or key > best_key:
-                best_key = key
-                best_threshold = threshold
+                tp = per_class_tp[cls_idx]
+                fp = per_class_fp[cls_idx]
+                recall_sum += tp / max(class_gt, 1) - old_recall
+                fdr_sum += fp / max(tp + fp, 1) - old_fdr
+            super_recall = recall_sum / len(ids)
+            super_fdr = fdr_sum / len(ids)
+            if super_fdr <= max_fdr:
+                key = (super_recall, -super_fdr, threshold)
+                if key > best_key:
+                    best_key = key
+                    best_threshold = threshold
         if best_threshold is None:
             # The empty-prediction point always has FDR 0, so a group with
             # GT can only land here if the caller passed a negative budget.
