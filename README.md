@@ -2,9 +2,9 @@
 
 This repository trains a 25-class optical-satellite aircraft/vehicle
 detector (BAFNet on mmdetection 2.x) and reports metrics in the format
-required by the official competition. The pipeline uses **fixed
-per-class score thresholds**, an **8:2 train/val split**, **two-stage
-training** (official → mixed official + ShipRS fine-tune), and
+required by the official competition. The pipeline uses an **8:2
+train/val split**, **two-stage training** (official → mixed official +
+ShipRS fine-tune), adaptive validation-time score calibration, and
 **max-inference-time** reporting on simulated 10 000 × 10 000 mosaics.
 
 ## Quick start
@@ -28,6 +28,7 @@ bash run.sh
 | `SHIPRS_WEIGHT`   | `0.30`                              | Stage-2 ShipRS sampling weight               |
 | `BIG_IMAGE_COUNT` | `2`                                 | How many 10 000 × 10 000 mosaics to compose  |
 | `DEVICE`        | `cuda:0`                             | Inference device                             |
+| `MAX_THRESHOLD_FDR` | `0.19`                           | Final threshold-search official FDR budget   |
 
 ## Pipeline stages
 
@@ -38,7 +39,8 @@ bash run.sh
 * Converts YOLO labels to COCO JSON (`tools/convert_yolo_to_coco.py`).
 * Trains `aircraft_bafnet_1x.py` from scratch.
 * Chooses the best checkpoint on the 20% val pool using the official
-  Recall/FDR protocol (`OfficialBestSaverHook`).
+  Recall/FDR protocol (`OfficialBestSaverHook`). Each validation epoch
+  searches one exact score threshold for ship, aircraft, and vehicle.
 * Best is saved to `work_dirs/official_stage/best_official_recall_fdr.pth`.
 
 ### Stage 2 — mixed official + ShipRS fine-tune
@@ -52,9 +54,13 @@ bash run.sh
 ### Stage 3 — validation reporting
 
 * **bbox**: standard COCO mAP on official val.
-* **fixed-threshold per-class predictions** (`tools/eval_val_to_json.py`).
+* **dense validation predictions** (`tools/eval_val_to_json.py`) at the
+  model candidate floor (`0.0`).
+* **25-class threshold search** (`tools/search_recall_fdr_thresholds.py`)
+  under official FDR ≤ 0.19. The resulting JSON is bound to the stage-2
+  checkpoint SHA-256.
 * **official metrics** (`tools/eval_recall_fdr.py`) — per-class,
-  superclass, official, and merged counts.
+  superclass, official, and merged counts on the filtered predictions.
 * **10 000 × 10 000 mosaics** (`tools/compose_big_val.py`) composed
   from val images without resizing or splitting source images.
 * **Sliding-window batch inference** (`tools/infer_big_image.py`)
@@ -65,10 +71,12 @@ bash run.sh
 ## Official metric definitions
 
 * Per-class IoU: 0.50 for ship/aircraft, 0.35 for FSC (vehicle).
-* Per-class score thresholds are hard-coded from
-  `ret/threshold_search_fdr_0.19_selected.csv` and live in
-  `mmdet/core/evaluation/official_metrics.py`. The CSV is the audit
-  source only; runtime imports the literals.
+* Training-time validation searches one exact threshold per superclass,
+  with each superclass mean FDR constrained to 0.19.
+* After stage 2, validation predictions are searched once for 25 final
+  thresholds. `final_thresholds.json` is then reused unchanged for ordinary
+  validation, simulated 10k images, and the independent official test set.
+* Historical `ret/*.csv` files are audit-only and are never runtime inputs.
 * `official_recall = mean(ship_recall, aircraft_recall, vehicle_recall)`
 * `official_fdr    = mean(ship_fdr,    aircraft_fdr,    vehicle_fdr)`
 * `merged_*` aggregates TP/FP/FN across all 25 classes before computing
@@ -85,16 +93,22 @@ bash run.sh
 * Hardware: designed for a single RTX 3090. Timing comparability across
   runs assumes the same GPU + driver stack.
 * Best checkpoint filenames are **`best_official_recall_fdr.pth`** plus
-  matching `best_official_recall_fdr.json`. The legacy
-  `best_bbox_mAP.pth` is still produced for diagnostic mAP tracking but
-  is no longer used for selection.
-* `data.test` in the dataset config is an alias pointing at `data.val`
-  (so `tools/test.py` keeps working). There is no independent test split.
+  matching `best_official_recall_fdr.json`. COCO mAP remains a reported
+  diagnostic metric but does not save or select a separate best model.
+* Frozen thresholds are stored at
+  `work_dirs/shiprs_finetune_stage/final_thresholds.json`. Loading them
+  against a different checkpoint fails the SHA-256 identity check.
+* The official independent test set never participates in threshold search;
+  it only consumes the frozen stage-2 artifact.
+* `data.test` in the training dataset config is an alias pointing at
+  `data.val` (so `tools/test.py` keeps working). The competition's
+  separately supplied official test set remains external to this split and
+  must only consume the frozen thresholds; it is never used for calibration.
 
 ## Where to read more
 
 * Design spec: `docs/superpowers/specs/2026-08-26-official-recall-training-pipeline-design.md`
-* Implementation plan: `docs/superpowers/plans/2026-08-26-official-recall-training-pipeline.md`
+* Implementation plan: `docs/superpowers/plans/2026-08-26-adaptive-score-threshold-workflow.md`
 * Shared metrics module: `mmdet/core/evaluation/official_metrics.py`
 * Checkpoint hooks: `mmdet/core/evaluation/eval_hooks.py`
   (`OfficialBestSaverHook`, `OfficialEarlyStoppingHook`)

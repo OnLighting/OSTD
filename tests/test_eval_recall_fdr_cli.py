@@ -40,3 +40,39 @@ def test_cli_marks_official_metric_unavailable_when_a_superclass_has_no_gt(
     official = payload['overall']['official']
     assert official['available'] is False
     assert set(official['unavailable_superclasses']) == {'aircraft', 'vehicle'}
+
+
+def test_cli_evaluates_low_score_prediction_exactly_as_supplied(
+        tmp_path, monkeypatch):
+    gt_path = tmp_path / 'gt.json'
+    pred_path = tmp_path / 'pred.json'
+    out_prefix = tmp_path / 'metrics'
+    common = {
+        'images': [{'id': 1, 'file_name': 'one.jpg'}],
+        'categories': [],
+    }
+    gt_path.write_text(json.dumps({
+        **common,
+        'annotations': [{
+            'id': 1, 'image_id': 1, 'category_id': 0,
+            'bbox': [0, 0, 10, 10],
+        }],
+    }), encoding='utf-8')
+    pred_path.write_text(json.dumps({
+        **common,
+        'annotations': [{
+            'id': 1, 'image_id': 1, 'category_id': 0,
+            'bbox': [0, 0, 10, 10], 'score': 0.00001,
+        }],
+    }), encoding='utf-8')
+    monkeypatch.setattr(sys, 'argv', [
+        'eval_recall_fdr.py', '--pred', str(pred_path), '--gt', str(gt_path),
+        '--out-prefix', str(out_prefix),
+    ])
+
+    eval_recall_fdr.main()
+
+    payload = json.loads(
+        (tmp_path / 'metrics.json').read_text(encoding='utf-8'))
+    assert payload['overall']['tp'] == 1
+    assert payload['per_class'][0]['tp'] == 1

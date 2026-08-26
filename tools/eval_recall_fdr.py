@@ -9,7 +9,8 @@ training EvalHook, and big-image inference all agree on:
   - Duplicate matches (one GT, multiple preds) count the top-1 as TP, the rest
     as FP.
   - Unmatched preds → FP. Unmatched GT → FN.
-  - 25 fixed per-class score thresholds from ``CLASS_SCORE_THRESHOLDS``.
+  - Predictions are evaluated exactly as supplied; decision-threshold
+    filtering happens before this reporting CLI.
 
 Inputs:
   --pred  json produced by tools/infer_big_image.py (COCO-style with `score`).

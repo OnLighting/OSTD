@@ -13,7 +13,8 @@
 #   - Runs standard COCO bbox mAP eval on the stage-2 best via
 #     tools/test.py (the official pipeline has no independent test split;
 #     data.test is an alias for data.val).
-#   - Exports fixed-threshold per-class val predictions.
+#   - Exports dense val predictions, searches 25 final thresholds once,
+#     and freezes them to the stage-2 best checkpoint.
 #   - Reports official Recall/FDR metrics on val.
 #   - Composes 10000x10000 mosaics from val.
 #   - Runs batched sliding-window inference on every mosaic.
@@ -38,6 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${SHIPRS_WEIGHT:=0.30}"
 : "${BIG_IMAGE_COUNT:=2}"
 : "${DEVICE:=cuda:0}"
+: "${MAX_THRESHOLD_FDR:=0.19}"
 : "${NAMES:=HM,LQS,QHS,MS,A1_SU-35,A2_C-130,A3_C-17,A4_C-5,A5_F-16,A6_TU-160,A7_E-3,A8_B-52,A9_P-3C,A10_B-1B,A11_E-8,A12_TU-22,A13_F-15,A14_KC-135,A15_F-22,A16_FA-18,A17_TU-95,A18_KC-10,A19_SU-34,A20_SU-24,FSC}"
 
 # We always pass --cfg-options overrides so that DATA_ROOT and SHIPRS_ROOT
@@ -183,7 +185,10 @@ log "Stage 2 best: $STAGE2_BEST"
 # Stage 3: validation reporting (ordinary + bbox + big-image)
 # ----------------------------------------------------------------------------
 
-VAL_PRED="$FINETUNE_WORK/val_preds.json"
+VAL_DENSE_PRED="$FINETUNE_WORK/val_preds_dense.json"
+FINAL_THRESHOLD_PREFIX="$FINETUNE_WORK/final_thresholds"
+FINAL_THRESHOLD_JSON="${FINAL_THRESHOLD_PREFIX}.json"
+FINAL_FILTERED_PRED="${FINAL_THRESHOLD_PREFIX}_filtered_preds.json"
 VAL_METRICS_PREFIX="$FINETUNE_WORK/val_metrics"
 BBOX_JSON="$FINETUNE_WORK/bbox_metrics.json"
 
@@ -201,19 +206,31 @@ if [ -n "${latest_eval:-}" ]; then
     cp "$latest_eval" "$BBOX_JSON"
 fi
 
-log "Exporting val predictions with fixed per-class thresholds"
+log "Exporting dense val predictions at the candidate score floor"
 python tools/eval_val_to_json.py \
     --config "$OFFICIAL_CONFIG" \
     --checkpoint "$STAGE2_BEST" \
     --img-dir "$DATA_ROOT/images/val" \
     --gt "$DATA_ROOT/annotations/instances_val.json" \
-    --out "$VAL_PRED" \
+    --out "$VAL_DENSE_PRED" \
     --device "$DEVICE"
 
-log "Reporting official Recall/FDR metrics on val"
+log "Searching and freezing 25 class thresholds on official val"
+python tools/search_recall_fdr_thresholds.py \
+    --pred "$VAL_DENSE_PRED" \
+    --gt "$OFFICIAL_VAL_ANN" \
+    --checkpoint "$STAGE2_BEST" \
+    --classes 25 --names "$NAMES" \
+    --max-official-fdr "$MAX_THRESHOLD_FDR" \
+    --target-official-recall 0.85 \
+    --out-prefix "$FINAL_THRESHOLD_PREFIX"
+require_file "$FINAL_THRESHOLD_JSON"
+require_file "$FINAL_FILTERED_PRED"
+
+log "Reporting official Recall/FDR metrics on threshold-filtered val"
 python tools/eval_recall_fdr.py \
-    --pred "$VAL_PRED" \
-    --gt "$DATA_ROOT/annotations/instances_val.json" \
+    --pred "$FINAL_FILTERED_PRED" \
+    --gt "$OFFICIAL_VAL_ANN" \
     --classes 25 --names "$NAMES" \
     --out-prefix "$VAL_METRICS_PREFIX"
 
@@ -238,6 +255,7 @@ log "Running sliding-window batch inference on mosaics"
 python tools/infer_big_image.py \
     --config "$OFFICIAL_CONFIG" \
     --checkpoint "$STAGE2_BEST" \
+    --thresholds "$FINAL_THRESHOLD_JSON" \
     --img-dir "$BIG_VAL_IMG_DIR" \
     --gt "$BIG_VAL_GT" \
     --out "$BIG_VAL_PRED" \
@@ -256,7 +274,10 @@ log "Artifacts:"
 log "  Stage 1 best:        $STAGE1_BEST (+ $OFFICIAL_WORK/best_official_recall_fdr.json)"
 log "  Stage 2 best:        $STAGE2_BEST (+ $FINETUNE_WORK/best_official_recall_fdr.json)"
 log "  COCO bbox (stage 2): $BBOX_JSON (latest eval JSON copied from $FINETUNE_WORK/bbox_eval/)"
-log "  Val predictions:     $VAL_PRED"
+log "  Dense val predictions:$VAL_DENSE_PRED"
+log "  Frozen thresholds:   $FINAL_THRESHOLD_JSON"
+log "  Threshold audit:     ${FINAL_THRESHOLD_PREFIX}_{selected,global_curve,class_curves}.csv"
+log "  Filtered val preds:  $FINAL_FILTERED_PRED"
 log "  Val official metrics:${VAL_METRICS_PREFIX}.{json,csv}"
 log "  Mosaic GT:           $BIG_VAL_GT"
 log "  Mosaic source map:   $BIG_VAL_MAP"
