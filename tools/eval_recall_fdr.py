@@ -1,12 +1,15 @@
 """Competition-grade evaluation — NOT COCO mAP.
 
-Implements the §2 protocol from data/DATASET_OVERVIEW.md:
+Implements the §2 protocol from data/DATASET_OVERVIEW.md using the
+shared ``mmdet.core.evaluation.official_metrics`` module so the CLI,
+training EvalHook, and big-image inference all agree on:
 
   - Score-desc one-to-one matching.
   - Per-prediction IoU threshold τ (FSC=24 → 0.35, others → 0.5).
   - Duplicate matches (one GT, multiple preds) count the top-1 as TP, the rest
     as FP.
   - Unmatched preds → FP. Unmatched GT → FN.
+  - 25 fixed per-class score thresholds from ``CLASS_SCORE_THRESHOLDS``.
 
 Inputs:
   --pred  json produced by tools/infer_big_image.py (COCO-style with `score`).
@@ -29,28 +32,10 @@ from collections import defaultdict
 
 import numpy as np
 
-
-def super_of(name):
-    """Map a class name to its official三大类 group.
-
-    ship = HM/LQS/QHS/MS (categories 0-3)
-    aircraft = anything starting with 'A' (categories 4-23)
-    vehicle = FSC (category 24)
-    """
-    if name in {'HM', 'LQS', 'QHS', 'MS'}:
-        return 'ship'
-    if name == 'FSC':
-        return 'vehicle'
-    if isinstance(name, str) and name.startswith('A'):
-        return 'aircraft'
-    return None
+from mmdet.core.evaluation import CLASS_IOU_THRESHOLDS, CLASS_NAMES
 
 
-TAU_DEFAULT = 0.5
-TAU_OVERRIDE = {24: 0.35}  # FSC (launch vehicle)
-
-
-def iou_xywh(box, boxes):
+def _iou_xywh(box, boxes):
     """Vector IoU between one box and an array of boxes (COCO xywh)."""
     if len(boxes) == 0:
         return np.zeros((0,), np.float32)
@@ -79,54 +64,6 @@ def iou_xywh(box, boxes):
     inter = inter_w * inter_h
     union = area1 + areas2 - inter
     return np.where(union > 0, inter / np.maximum(union, 1e-9), 0.0)
-
-
-def match_image(preds_by_cls, gts_by_cls):
-    """Returns per-class (tp, fp, fn) for a single image.
-
-    ``preds_by_cls`` and ``gts_by_cls`` map class IDs to box arrays.
-    """
-    cls_tp = defaultdict(int)
-    cls_fp = defaultdict(int)
-    cls_fn = defaultdict(int)
-
-    classes = set(preds_by_cls.keys()) | set(gts_by_cls.keys())
-    for c in classes:
-        gt = gts_by_cls.get(c, {'boxes': np.zeros((0, 4))})
-        p = preds_by_cls.get(
-            c, {
-                'boxes': np.zeros((0, 4)),
-                'scores': np.zeros((0, ))
-            })
-        gt_boxes = gt['boxes']
-        n_gt = len(gt_boxes)
-        n_p = len(p['boxes'])
-        gt_matched = np.zeros(n_gt, dtype=bool)
-        pr_matched = np.zeros(n_p, dtype=bool)
-
-        if n_p == 0:
-            cls_fn[c] += n_gt
-            continue
-
-        # Score descending.
-        order = np.argsort(-p['scores'])
-        tau = TAU_OVERRIDE.get(int(c), TAU_DEFAULT)
-        for pi in order:
-            b = p['boxes'][pi]
-            best_iou, best_gi = 0.0, -1
-            for gi in range(n_gt):
-                if gt_matched[gi]:
-                    continue
-                iou = iou_xywh(b, gt_boxes[gi:gi + 1])[0]
-                if iou > best_iou:
-                    best_iou, best_gi = iou, gi
-            if best_gi >= 0 and best_iou >= tau:
-                gt_matched[best_gi] = True
-                pr_matched[pi] = True
-        cls_tp[c] = int(pr_matched.sum())
-        cls_fp[c] = int((~pr_matched).sum())
-        cls_fn[c] = int((~gt_matched).sum())
-    return cls_tp, cls_fp, cls_fn
 
 
 def group_by_image_and_class(records, has_score):
@@ -159,20 +96,53 @@ def group_by_image_and_class(records, has_score):
 
 
 def aggregate_confusion_counts(pred_by_img, gt_by_img, image_ids):
-    """Aggregate per-class TP, FP, and FN across all official images."""
+    """Aggregate per-class TP, FP, and FN across all official images.
+
+    Implemented locally (rather than going through
+    ``evaluate_mmdet_results``) so this CLI can also report AP, which
+    the shared module deliberately omits. The matching logic mirrors
+    ``official_metrics._match_class`` to stay consistent.
+    """
     total_tp = defaultdict(int)
     total_fp = defaultdict(int)
     total_fn = defaultdict(int)
     for img_id in image_ids:
         preds = pred_by_img.get(img_id, {})
         gts = gt_by_img.get(img_id, {})
-        cls_tp, cls_fp, cls_fn = match_image(preds, gts)
-        for class_id, value in cls_tp.items():
-            total_tp[class_id] += value
-        for class_id, value in cls_fp.items():
-            total_fp[class_id] += value
-        for class_id, value in cls_fn.items():
-            total_fn[class_id] += value
+        classes = set(preds.keys()) | set(gts.keys())
+        for c in classes:
+            gt_entry = gts.get(
+                c, {'boxes': np.zeros((0, 4), dtype=np.float32)})
+            p_entry = preds.get(
+                c, {
+                    'boxes': np.zeros((0, 4), dtype=np.float32),
+                    'scores': np.zeros((0,), dtype=np.float32),
+                })
+            gt_boxes = gt_entry['boxes']
+            n_gt = len(gt_boxes)
+            n_p = len(p_entry['boxes'])
+            gt_matched = np.zeros(n_gt, dtype=bool)
+            pr_matched = np.zeros(n_p, dtype=bool)
+            if n_p == 0:
+                total_fn[c] += n_gt
+                continue
+            order = np.argsort(-p_entry['scores'])
+            tau = CLASS_IOU_THRESHOLDS[int(c)]
+            for pi in order:
+                b = p_entry['boxes'][pi]
+                best_iou, best_gi = 0.0, -1
+                for gi in range(n_gt):
+                    if gt_matched[gi]:
+                        continue
+                    iou = _iou_xywh(b, gt_boxes[gi:gi + 1])[0]
+                    if iou > best_iou:
+                        best_iou, best_gi = iou, gi
+                if best_gi >= 0 and best_iou >= tau:
+                    gt_matched[best_gi] = True
+                    pr_matched[pi] = True
+            total_tp[c] += int(pr_matched.sum())
+            total_fp[c] += int((~pr_matched).sum())
+            total_fn[c] += int((~gt_matched).sum())
     return total_tp, total_fp, total_fn
 
 
@@ -202,7 +172,7 @@ def average_precision_for_class(pred_by_img, gt_by_img, class_id, image_ids):
     predictions.sort(key=lambda item: item[0], reverse=True)
     tp_flags = np.zeros(len(predictions), dtype=np.float64)
     fp_flags = np.ones(len(predictions), dtype=np.float64)
-    tau = TAU_OVERRIDE.get(int(class_id), TAU_DEFAULT)
+    tau = CLASS_IOU_THRESHOLDS[int(class_id)]
 
     for pred_idx, (_, img_id, box) in enumerate(predictions):
         gt_entry = gt_by_img.get(img_id, {}).get(
@@ -211,7 +181,7 @@ def average_precision_for_class(pred_by_img, gt_by_img, class_id, image_ids):
         unmatched = np.flatnonzero(~matched_by_img[img_id])
         if unmatched.size == 0:
             continue
-        overlaps = iou_xywh(box, gt_boxes[unmatched])
+        overlaps = _iou_xywh(box, gt_boxes[unmatched])
         best_local = int(overlaps.argmax())
         if overlaps[best_local] >= tau:
             matched_by_img[img_id][unmatched[best_local]] = True
@@ -230,6 +200,17 @@ def average_precision_for_class(pred_by_img, gt_by_img, class_id, image_ids):
         for recall in recall_points
     ]
     return float(np.mean(interpolated))
+
+
+def super_of(name):
+    """Map a class name to its official三大类 group."""
+    if name in {'HM', 'LQS', 'QHS', 'MS'}:
+        return 'ship'
+    if name == 'FSC':
+        return 'vehicle'
+    if isinstance(name, str) and name.startswith('A'):
+        return 'aircraft'
+    return None
 
 
 def build_metrics_payload(overall, per_class_rows):
@@ -335,7 +316,7 @@ def main():
     if args.names:
         names = args.names.split(',')
     else:
-        names = [str(i) for i in range(args.classes)]
+        names = list(CLASS_NAMES)
 
     overall_tp = sum(total_tp.values())
     overall_fp = sum(total_fp.values())
@@ -356,7 +337,7 @@ def main():
         p = tp / max(tp + fp, 1) if (tp + fp) > 0 else float('nan')
         ap = average_precision_for_class(
             pred_by_img, gt_by_img, c, image_ids)
-        ap_tau = TAU_OVERRIDE.get(c, TAU_DEFAULT)
+        ap_tau = CLASS_IOU_THRESHOLDS[c]
         if not math.isnan(ap):
             valid_aps.append(ap)
         rows.append((
@@ -377,7 +358,6 @@ def main():
               f'{ap_tau:>4.2f}')
 
     # P0-A: 三大类官方补充口径聚合
-    from collections import defaultdict
     super_recalls = defaultdict(list)
     super_fdrs = defaultdict(list)
     for row in rows:

@@ -2,10 +2,15 @@
 
 Output is consumed by tools/eval_recall_fdr.py. Each detected box keeps its
 score so the Recall/FDR protocol's score-desc one-to-one matching works.
-
 This avoids the pkl-format gap in tools/test.py — for the competition metric
 (score-ranked, class-conditional IoU) we need per-box scores, which pkl
 doesn't carry cleanly.
+
+Per-class score thresholds come from the shared
+``mmdet.core.evaluation.official_metrics`` module. The script lowers the
+model's ``test_cfg.rcnn.score_thr`` to the minimum of those thresholds so
+the model emits low-threshold predictions and the per-class filter can
+apply the right cutoff downstream.
 
 Usage:
     python tools/eval_val_to_json.py \
@@ -26,16 +31,51 @@ import numpy as np
 from mmcv import Config
 from mmdet.apis import init_detector, inference_detector
 
+from mmdet.core.evaluation import (CLASS_NAMES, CLASS_SCORE_THRESHOLDS,
+                                   filter_mmdet_results)
+
 from sbla_config import apply_model_ablation_config
 
 
-CLASS_NAMES = [
-    'HM', 'LQS', 'QHS', 'MS',
-    'A1_SU-35', 'A2_C-130', 'A3_C-17', 'A4_C-5', 'A5_F-16', 'A6_TU-160',
-    'A7_E-3', 'A8_B-52', 'A9_P-3C', 'A10_B-1B', 'A11_E-8', 'A12_TU-22',
-    'A13_F-15', 'A14_KC-135', 'A15_F-22', 'A16_FA-18', 'A17_TU-95',
-    'A18_KC-10', 'A19_SU-34', 'A20_SU-24', 'FSC',
-]
+# A safety floor so very low-threshold classes (e.g. LQS=0.0019) still get
+# surviving candidates before the per-class filter runs.
+_MIN_SCORE_FLOOR = 0.0
+
+
+def detections_to_coco_annotations(result, image_id, next_ann_id):
+    """Convert a per-image mmdet result (25-class list) into COCO anns.
+
+    Applies the shared per-class score threshold via ``filter_mmdet_results``
+    so every class uses its own cutoff (not a single global one).
+
+    Args:
+        result (list[np.ndarray]): 25-class mmdet output (xyxy+score).
+        image_id (int): COCO image id used for image_id alignment with GT.
+        next_ann_id (int): next free annotation id; returned unchanged when
+            no boxes survive.
+
+    Returns:
+        tuple[list[dict], int]: COCO-style annotations and the next free
+        annotation id.
+    """
+    filtered = filter_mmdet_results(result)
+    anns = []
+    ann_id = next_ann_id
+    for cls_idx, boxes in enumerate(filtered):
+        if len(boxes) == 0:
+            continue
+        for row in boxes:
+            x1, y1, x2, y2, s = row.tolist()
+            anns.append({
+                'id': ann_id,
+                'image_id': int(image_id),
+                'category_id': int(cls_idx),
+                'bbox': [x1, y1, x2 - x1, y2 - y1],
+                'score': float(s),
+                'area': float((x2 - x1) * (y2 - y1)),
+            })
+            ann_id += 1
+    return anns, ann_id
 
 
 def main():
@@ -46,12 +86,15 @@ def main():
     parser.add_argument('--gt', required=True,
                         help='COCO gt json (for image id alignment).')
     parser.add_argument('--out', required=True)
-    parser.add_argument('--score', type=float, default=0.05)
     parser.add_argument('--device', default='cuda:0')
     args = parser.parse_args()
 
     cfg = Config.fromfile(args.config)
-    cfg.model.test_cfg.rcnn.score_thr = args.score
+    # The per-class filter handles the real cutoffs; lower the model-side
+    # threshold to the floor so low-threshold classes survive the model
+    # stage and reach the per-class filter.
+    min_thr = max(_MIN_SCORE_FLOOR, float(min(CLASS_SCORE_THRESHOLDS)) - 1e-6)
+    cfg.model.test_cfg.rcnn.score_thr = min_thr
     apply_model_ablation_config(cfg)
     model = init_detector(cfg, args.checkpoint, device=args.device)
 
@@ -74,31 +117,18 @@ def main():
     for i, img_path in enumerate(img_files, start=1):
         result = inference_detector(model, str(img_path))
         # result is list[np.ndarray (N,5)] indexed by class.
-        added = 0
-        for cls_idx, bboxes in enumerate(result):
-            if len(bboxes) == 0:
-                continue
-            keep = bboxes[:, 4] >= args.score
-            if not np.any(keep):
-                continue
-            b = bboxes[keep]
-            for row in b:
-                x1, y1, x2, y2, s = row.tolist()
-                ann.append({
-                    'id': ann_id,
-                    'image_id': name_to_id[img_path.name],
-                    'category_id': int(cls_idx),
-                    'bbox': [x1, y1, x2 - x1, y2 - y1],
-                    'score': float(s),
-                    'area': float((x2 - x1) * (y2 - y1)),
-                })
-                ann_id += 1
-                added += 1
-        if added == 0:
+        if not name_to_id.__contains__(img_path.name):
+            raise KeyError(
+                f'Image file {img_path.name} not found in GT file_name set; '
+                'check that --gt points at the same split as --img-dir.')
+        added, ann_id = detections_to_coco_annotations(
+            result, name_to_id[img_path.name], ann_id)
+        ann.extend(added)
+        if not added:
             n_empty += 1
         if i % 50 == 0 or i == len(img_files):
             elapsed = time.perf_counter() - t0
-            print(f'  {i}/{len(img_files)}  boxes={ann_id - 1}  '
+            print(f'  {i}/{len(img_files)}  boxes={len(ann)}  '
                   f'elapsed={elapsed:.1f}s  empty={n_empty}')
 
     out = {
@@ -111,7 +141,8 @@ def main():
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False)
     print(f'Wrote {out_path}: {len(ann)} boxes over {len(img_files)} images '
-          f'({n_empty} images with no prediction above score={args.score})')
+          f'({n_empty} images with no prediction above the per-class '
+          f'score thresholds)')
 
 
 if __name__ == '__main__':
