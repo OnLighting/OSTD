@@ -6,11 +6,9 @@ This avoids the pkl-format gap in tools/test.py — for the competition metric
 (score-ranked, class-conditional IoU) we need per-box scores, which pkl
 doesn't carry cleanly.
 
-Per-class score thresholds come from the shared
-``mmdet.core.evaluation.official_metrics`` module. The script lowers the
-model's ``test_cfg.rcnn.score_thr`` to the minimum of those thresholds so
-the model emits low-threshold predictions and the per-class filter can
-apply the right cutoff downstream.
+By default the script exports dense predictions at the shared candidate
+floor for post-training threshold search. Passing ``--thresholds`` loads a
+checkpoint-bound frozen artifact and applies its 25 class thresholds.
 
 Usage:
     python tools/eval_val_to_json.py \
@@ -31,22 +29,19 @@ import numpy as np
 from mmcv import Config
 from mmdet.apis import init_detector, inference_detector
 
-from mmdet.core.evaluation import (CLASS_NAMES, CLASS_SCORE_THRESHOLDS,
-                                   filter_mmdet_results)
+from mmdet.core.evaluation import (CANDIDATE_SCORE_FLOOR, CLASS_NAMES,
+                                   filter_mmdet_results,
+                                   load_threshold_artifact)
 
 from sbla_config import apply_model_ablation_config
 
 
-# A safety floor so very low-threshold classes (e.g. LQS=0.0019) still get
-# surviving candidates before the per-class filter runs.
-_MIN_SCORE_FLOOR = 0.0
-
-
-def detections_to_coco_annotations(result, image_id, next_ann_id):
+def detections_to_coco_annotations(result, image_id, next_ann_id,
+                                   score_thresholds=None):
     """Convert a per-image mmdet result (25-class list) into COCO anns.
 
-    Applies the shared per-class score threshold via ``filter_mmdet_results``
-    so every class uses its own cutoff (not a single global one).
+    ``score_thresholds=None`` preserves every model-retained candidate.
+    Otherwise the supplied 25 class thresholds are applied explicitly.
 
     Args:
         result (list[np.ndarray]): 25-class mmdet output (xyxy+score).
@@ -58,7 +53,8 @@ def detections_to_coco_annotations(result, image_id, next_ann_id):
         tuple[list[dict], int]: COCO-style annotations and the next free
         annotation id.
     """
-    filtered = filter_mmdet_results(result)
+    filtered = (result if score_thresholds is None
+                else filter_mmdet_results(result, score_thresholds))
     anns = []
     ann_id = next_ann_id
     for cls_idx, boxes in enumerate(filtered):
@@ -87,14 +83,16 @@ def main():
                         help='COCO gt json (for image id alignment).')
     parser.add_argument('--out', required=True)
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument(
+        '--thresholds', default=None,
+        help='Optional frozen threshold artifact; omit for dense export.')
     args = parser.parse_args()
 
+    score_thresholds = (
+        load_threshold_artifact(args.thresholds, args.checkpoint)
+        if args.thresholds else None)
     cfg = Config.fromfile(args.config)
-    # The per-class filter handles the real cutoffs; lower the model-side
-    # threshold to the floor so low-threshold classes survive the model
-    # stage and reach the per-class filter.
-    min_thr = max(_MIN_SCORE_FLOOR, float(min(CLASS_SCORE_THRESHOLDS)) - 1e-6)
-    cfg.model.test_cfg.rcnn.score_thr = min_thr
+    cfg.model.test_cfg.rcnn.score_thr = CANDIDATE_SCORE_FLOOR
     apply_model_ablation_config(cfg)
     model = init_detector(cfg, args.checkpoint, device=args.device)
 
@@ -102,12 +100,21 @@ def main():
         gt = json.load(f)
     # file_name -> image_id (1:1 from gt so eval_recall_fdr can join)
     name_to_id = {im['file_name']: im['id'] for im in gt['images']}
+    if len(name_to_id) != len(gt['images']):
+        raise ValueError('validation GT contains duplicate file_name values')
 
     img_dir = Path(args.img_dir)
-    img_files = sorted(
-        p for p in img_dir.iterdir()
+    discovered = {
+        p.name: p for p in img_dir.iterdir()
         if p.is_file() and p.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp'}
-    )
+    }
+    missing = sorted(set(name_to_id) - set(discovered))
+    unexpected = sorted(set(discovered) - set(name_to_id))
+    if missing or unexpected:
+        raise ValueError(
+            'GT/image directory mismatch: missing={}, unexpected={}'.format(
+                missing, unexpected))
+    img_files = [discovered[image['file_name']] for image in gt['images']]
     print(f'Found {len(img_files)} val images.')
 
     ann = []
@@ -122,7 +129,8 @@ def main():
                 f'Image file {img_path.name} not found in GT file_name set; '
                 'check that --gt points at the same split as --img-dir.')
         added, ann_id = detections_to_coco_annotations(
-            result, name_to_id[img_path.name], ann_id)
+            result, name_to_id[img_path.name], ann_id,
+            score_thresholds=score_thresholds)
         ann.extend(added)
         if not added:
             n_empty += 1
@@ -140,9 +148,10 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as f:
         json.dump(out, f, ensure_ascii=False)
+    mode = 'dense candidate floor' if score_thresholds is None \
+        else f'frozen thresholds from {args.thresholds}'
     print(f'Wrote {out_path}: {len(ann)} boxes over {len(img_files)} images '
-          f'({n_empty} images with no prediction above the per-class '
-          f'score thresholds)')
+          f'({n_empty} empty images; mode={mode})')
 
 
 if __name__ == '__main__':
