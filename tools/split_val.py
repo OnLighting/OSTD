@@ -1,22 +1,24 @@
-"""Stratified train/val/test split for the aircraft dataset.
+"""Stratified train/val split for the aircraft dataset.
 
-Default 6:2:2 (train:val:test). Reads YOLO labels from data/labels/train,
-draws images into data/images/{train,val,test} + data/labels/{train,val,test}
-using stratified-by-class sampling so every class appears in val AND test.
-Skips images whose label file is empty or missing.
+Official pipeline: 80% train, 20% validation, no independent test split.
+Reads YOLO labels from data/labels/train, draws images into
+data/images/{train,val} + data/labels/{train,val} using stratified-by-
+class sampling so every class appears in val. Skips images whose label
+file is empty or missing.
 
-Important: this script MOVES images/labels out of the original `train/` pool
-into `val/` and `test/`. `train/` keeps the remaining 60%. Run it once, then
-re-run tools/convert_yolo_to_coco.py for all three splits.
+Important: this script MOVES images/labels out of the original `train/`
+pool into `val/`. `train/` keeps the remaining 80%. Run it once, then
+re-run tools/convert_yolo_to_coco.py for both splits.
 
 Usage:
-    python tools/split_val.py --root data --ratios 0.6 0.2 0.2 --seed 0 --overwrite
+    python tools/split_val.py --root data --ratios 0.8 0.2 --seed 0 --overwrite
 """
 
 import argparse
 import os
 import random
 import shutil
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,11 +32,11 @@ CLASS_NAMES = [
 ]
 IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp'}
 # 极稀有类保护阈值: len(by_class[c]) < RARE_THRESHOLD 的类全部保留给 train,
-# val/test 不分。这是防御 n=2 / n=3 边界情况: 如果按比例拿 1 张进 val,
+# val 不分。这是防御 n=2 / n=3 边界情况: 如果按比例拿 1 张进 val,
 # train 也只能剩 1-2 张, 出现 val ≈ train 甚至 val > train 的情况。
 RARE_THRESHOLD = 5
 # 每个类在 train split 里至少保留下限 (boxes). 如果 split 之后某类的
-# train box 数 < MIN_TRAIN_PER_CLASS, 把 val/test 里多余的挪回 train.
+# train box 数 < MIN_TRAIN_PER_CLASS, 把 val 里多余的挪回 train.
 # 这是关键防御: 类间重叠时 (如 HM 经常和 MS 同图出现) val_set 拿走一张
 # 含 HM 的图, train 里 HM box 数可能降到 0。MIN_TRAIN_PER_CLASS 保证
 # train 里每个类至少有几张 box。
@@ -79,52 +81,55 @@ def image_classes(label_path: Path):
     return classes
 
 
-def stratified_three_way(stems, labels, ratios, seed):
-    """Split into (train, val, test) per-class stratified with no overlap.
+def _stratified_n_way(stems, labels, ratios, seed):
+    """Generic stratified n-way split with shared pool + post-check.
 
-    ratios = (r_train, r_val, r_test), summing to ~1.0. The crucial fix vs.
-    the naive per-class slice is that we maintain a SHARED POOL: once a stem
-    is taken for val (or test) it is excluded from subsequent classes'
-    candidate sets, so the same image never lands in both val and test.
+    The crucial fix vs. naive per-class slice: once a stem is taken for
+    any non-train split it is excluded from subsequent classes'
+    candidate sets, so the same image never lands in two non-train splits.
 
-    Algorithm (v4):
-      1. 对 n < RARE_THRESHOLD 的极稀有类, 全部保留给 train (val/test 不分)。
-      2. 对 n >= RARE_THRESHOLD 的类, 按 ratio 分配 val/test, 并保证
-         train 至少 1 张 (即 n - k >= 1)。
+    Algorithm:
+      1. 对 n < RARE_THRESHOLD 的极稀有类, 全部保留给 train (其他 split 不分)。
+      2. 对 n >= RARE_THRESHOLD 的类, 按 ratio 分配到每个非 train split,
+         并保证 train 至少 1 张 (即 n - k >= 1)。
       3. Process rare classes first so they don't get starved.
       4. Everything else stays in train.
       5. **Post-check (关键防御)**: 计算 train split 里每个类的 box count,
-         如果某类 < MIN_TRAIN_PER_CLASS, 从 val/test 集合里把对应 stem
-         挪回 train (优先挪 val, 再挪 test). 这能解决类间重叠导致的
-         "train 集合里某类 box 数 < val 集合里该类 box 数" 问题。
-
-    返回 (train, val, test)。
+         如果某类 < MIN_TRAIN_PER_CLASS, 从非 train 集合里把对应 stem
+         挪回 train. 这能解决类间重叠导致的
+         "train 集合里某类 box 数 < 非 train 集合里该类 box 数" 问题。
     """
     rng = random.Random(seed)
-    r_train, r_val, r_test = ratios
+    if len(ratios) < 2:
+        raise ValueError('ratios must contain at least (train, val)')
+    if any(r < 0 for r in ratios):
+        raise ValueError('ratios must be non-negative')
+    total = sum(ratios)
+    if total <= 0:
+        raise ValueError('ratios sum must be positive')
+    normalized = [r / total for r in ratios]
 
     by_class = defaultdict(list)
     for stem, lbl in zip(stems, labels):
         for c in image_classes(lbl):
             by_class[c].append(stem)
 
-    # Sort classes by size ascending so rare classes (HM, LQS, FSC) get
-    # served first and are guaranteed >=1 in val/test.
     classes_in_order = sorted(by_class.keys(), key=lambda c: len(by_class[c]))
 
-    val_set = set()
-    test_set = set()
+    # n_split == len(ratios) - 1 (train + n-1 non-train splits).
+    n_split = len(ratios) - 1
+    split_sets = [set() for _ in range(n_split)]
+    split_names = [f'split{i}' for i in range(n_split)]
 
-    def take_for(into_set, ratio, label):
+    def take_for(into_set, ratio, *other_sets):
         for c in classes_in_order:
-            candidates = set(by_class[c]) - into_set - test_set - val_set
+            taken_anywhere = set().union(*other_sets, into_set)
+            candidates = set(by_class[c]) - taken_anywhere
             n = len(candidates)
             if n < RARE_THRESHOLD:
-                # 极稀有类不参与 split, 全部保留给 train.
                 continue
             members = sorted(candidates)
             k = int(round(n * ratio))
-            # Don't drain a class entirely; keep at least 1 sample for train.
             if n - k < 1:
                 k = max(0, n - 1)
             if k <= 0:
@@ -132,11 +137,14 @@ def stratified_three_way(stems, labels, ratios, seed):
             rng.shuffle(members)
             into_set.update(members[:k])
 
-    take_for(val_set, r_val, 'val')
-    take_for(test_set, r_test, 'test')
+    # Process splits in declaration order; other_sets contains the splits
+    # that come later so we don't double-book a stem.
+    for i in range(n_split):
+        others = split_sets[i + 1:]
+        take_for(split_sets[i], normalized[i + 1], *others)
 
-    # === Post-check: 修复类间重叠导致的 train 集合里 box count < val ===
-    # 计算 train_set 里每个类的 box count (一个图含 cls c 即计 1 box).
+    label_index = {lbl.stem: lbl for lbl in labels}
+
     def per_class_box_count(stem_set):
         counts = defaultdict(int)
         for stem in stem_set:
@@ -145,56 +153,70 @@ def stratified_three_way(stems, labels, ratios, seed):
                 counts[c] += 1
         return counts
 
-    # 构造 stem → label 索引 (避免反复扫描)
-    label_index = {lbl.stem: lbl for lbl in labels}
+    train_set = set(stems)
+    for s in split_sets:
+        train_set -= s
 
-    train_set = set(stems) - val_set - test_set
-
-    # 反复迭代, 直到 val/test 里没有任何类的 box 数 >= train 的对应类
-    # (即 "val/test 里某些类的 box 数 ≥ train 里同类的 box 数" 这种
-    # 边界 case 完全消除)。每个 pass 对每个类检查一次, 必要时从
-    # val/test 挪 1 个含该类的 stem 回 train。
     def _post_check():
         train_box_counts = per_class_box_count(train_set)
-        val_box_counts = per_class_box_count(val_set)
-        test_box_counts = per_class_box_count(test_set)
         moved = 0
-        for c in classes_in_order:
-            for src_set, src_counts in [(val_set, val_box_counts),
-                                         (test_set, test_box_counts)]:
+        for i in range(n_split):
+            split_box_counts = per_class_box_count(split_sets[i])
+            for c in classes_in_order:
                 tr_n = train_box_counts.get(c, 0)
-                sp_n = src_counts.get(c, 0)
+                sp_n = split_box_counts.get(c, 0)
                 if sp_n > 0 and sp_n >= tr_n:
-                    # 找一个含 c 的 stem 从 src_set 挪到 train_set
-                    for stem in list(src_set):
+                    for stem in list(split_sets[i]):
                         if c in image_classes(label_index[stem]):
-                            src_set.discard(stem)
+                            split_sets[i].discard(stem)
                             train_set.add(stem)
                             moved += 1
                             break
                     else:
                         continue
-                    break  # 只挪一次, 下次迭代再 check
+                    break
         return moved
 
-    # 反复 check, 直到一次迭代里 moved == 0
     while True:
         moved = _post_check()
         if moved == 0:
             break
 
     train = sorted(train_set)
-    val = sorted(val_set)
-    test = sorted(test_set)
-    return train, val, test
+    splits = [sorted(s) for s in split_sets]
+    return train, splits, split_names
+
+
+def stratified_train_val(stems, labels, ratios, seed):
+    """Stratified split returning (train, val) lists.
+
+    ``ratios`` is ``(r_train, r_val)`` summing to ~1.0.
+    """
+    train, splits, _ = _stratified_n_way(stems, labels, ratios, seed)
+    if len(splits) != 1:
+        raise ValueError(
+            f'stratified_train_val expects exactly 1 non-train split, '
+            f'got {len(splits)}')
+    return train, splits[0]
+
+
+def stratified_three_way(stems, labels, ratios, seed):
+    """Backwards-compatible three-way splitter used by old run.sh paths."""
+    train, splits, _ = _stratified_n_way(stems, labels, ratios, seed)
+    if len(splits) != 2:
+        raise ValueError(
+            f'stratified_three_way expects 2 non-train splits, got '
+            f'{len(splits)}')
+    return train, splits[0], splits[1]
 
 
 def move_into(root: Path, split_name, stems, image_index, train_lbl_dir):
-    """Copy (not move, to be safe) images+labels into the target split dir.
+    """Copy images+labels into the target split dir.
 
-    Images are copied from the train pool; labels are copied from train labels.
-    We copy rather than move so a re-run with --overwrite doesn't lose data —
-    the source train/ pool always stays intact until you delete it yourself.
+    Images are copied from the train pool; labels are copied from train
+    labels. We copy rather than move so a re-run with --overwrite doesn't
+    lose data — the source train/ pool always stays intact until you
+    delete it yourself.
     """
     out_img = root / 'images' / split_name
     out_lbl = root / 'labels' / split_name
@@ -229,20 +251,28 @@ def count_boxes(root, split_name, stems):
     return counts
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', default='data', type=str)
-    parser.add_argument('--ratios', nargs=3, type=float, default=[0.6, 0.2, 0.2],
-                        help='train val test ratios (default 0.6 0.2 0.2)')
+    parser.add_argument('--ratios', nargs='+', type=float,
+                        default=[0.8, 0.2],
+                        help='train val ratios; e.g. --ratios 0.8 0.2')
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--overwrite', action='store_true',
-                        help='Wipe existing val/ and test/ before writing.')
-    args = parser.parse_args()
+                        help='Wipe existing val/ before writing.')
+    args = parser.parse_args(argv)
+
+    if len(args.ratios) != 2:
+        print('ERROR: official pipeline requires exactly 2 ratios '
+              '(train val), got', len(args.ratios), file=sys.stderr)
+        return 1
 
     root = Path(args.root).resolve()
     images, labels, stems = collect_train_files(root)
     if not stems:
-        raise SystemExit(f'No train images with matching labels under {root}')
+        print(f'No train images with matching labels under {root}',
+              file=sys.stderr)
+        return 1
 
     # Drop empty-label images.
     keep_idx = [i for i, lbl in enumerate(labels) if image_classes(lbl)]
@@ -251,33 +281,33 @@ def main():
     stems = [stems[i] for i in keep_idx]
     print(f'Pool: {len(stems)} images with at least one label.')
 
-    r_train, r_val, r_test = args.ratios
-    total = r_train + r_val + r_test
-    r_train, r_val, r_test = r_train / total, r_val / total, r_test / total
-    print(f'Ratios -> train={r_train:.2f} val={r_val:.2f} test={r_test:.2f}')
+    r_train, r_val = args.ratios
+    total = r_train + r_val
+    r_train, r_val = r_train / total, r_val / total
+    print(f'Ratios -> train={r_train:.2f} val={r_val:.2f}')
 
-    train_stems, val_stems, test_stems = stratified_three_way(
-        stems, labels, (r_train, r_val, r_test), args.seed)
-    print(f'Split -> train={len(train_stems)}  val={len(val_stems)}  '
-          f'test={len(test_stems)}')
+    train_stems, val_stems = stratified_train_val(
+        stems, labels, (r_train, r_val), args.seed)
+    print(f'Split -> train={len(train_stems)}  val={len(val_stems)}')
 
     image_index = {p.stem: p for p in images}
     train_lbl_dir = root / 'labels' / 'train'
 
     if args.overwrite:
-        for s in ('val', 'test'):
-            wipe_split(root, s)
+        wipe_split(root, 'val')
+        # Guard against an unrelated test/ directory lingering from old runs;
+        # we don't want to copy val into it but we should not silently keep
+        # a stale 20% either.
+        wipe_split(root, 'test')
 
-    # NOTE: val/test images are COPIED out of train/. They are NOT removed from
-    # train/ here — to keep the train/ pool as the single source of truth, do
-    # the removal explicitly after you've confirmed the split looks right.
     move_into(root, 'val', val_stems, image_index, train_lbl_dir)
-    move_into(root, 'test', test_stems, image_index, train_lbl_dir)
+    # Do not create a test/ split — the official pipeline validates on the
+    # 20% val pool only.
 
-    # Remove val/test stems from the train pool so train/ truly holds only the
-    # 60% remainder. This is what makes the split honest.
+    # Remove val stems from the train pool so train/ truly holds only the
+    # 80% remainder. This is what makes the split honest.
     removed = 0
-    for stem in val_stems + test_stems:
+    for stem in val_stems:
         img = image_index[stem]
         if img.exists():
             img.unlink()
@@ -285,16 +315,11 @@ def main():
         lbl = train_lbl_dir / f'{stem}.txt'
         if lbl.exists():
             lbl.unlink()
-    print(f'Removed {removed} images+labels from train/ pool '
-          f'(moved to val/test).')
+    print(f'Removed {removed} images+labels from train/ pool (moved to val).')
 
-    # === 打印三个 split 的 per-class coverage (boxes) ===
-    # v3 修复: 之前只打印 val/test, 不打印 train, 用户无法直观对比
-    # "val vs train" 的 box count。现三个 split 都打印。
     splits_info = (
         ('train', train_stems),
         ('val', val_stems),
-        ('test', test_stems),
     )
     coverage = {}
     for name, slist in splits_info:
@@ -306,21 +331,21 @@ def main():
             if coverage[name][i]:
                 print(f'  {i:2d} {n:<10s} {coverage[name][i]}')
 
-    # === 防御性检测: val/test 中任意类的 box 数 >= train 的对应类 ===
+    # === 防御性检测: val 中任意类的 box 数 >= train 的对应类 ===
     warnings_emitted = 0
-    for name in ('val', 'test'):
-        for c, cls_name in enumerate(CLASS_NAMES):
-            tr_n = coverage['train'].get(c, 0)
-            sp_n = coverage[name].get(c, 0)
-            # 仅当 train 不为 0 但 val/test 反而 >= train 时报警
-            if tr_n > 0 and sp_n >= tr_n:
-                print(
-                    f'WARNING: {name} {cls_name}({c}) count={sp_n} '
-                    f'>= train count={tr_n}')
-                warnings_emitted += 1
+    for c, cls_name in enumerate(CLASS_NAMES):
+        tr_n = coverage['train'].get(c, 0)
+        sp_n = coverage['val'].get(c, 0)
+        if tr_n > 0 and sp_n >= tr_n:
+            print(
+                f'WARNING: val {cls_name}({c}) count={sp_n} '
+                f'>= train count={tr_n}')
+            warnings_emitted += 1
     if warnings_emitted == 0:
-        print('No class imbalance warning (all train > val, train > test).')
+        print('No class imbalance warning (all train > val).')
+
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
