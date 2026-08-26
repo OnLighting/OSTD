@@ -1,46 +1,209 @@
 #!/usr/bin/env bash
+#
+# Official Recall/FDR training pipeline (8:2 + 70/30 ShipRS mix).
+#
+# Two stages:
+#   1. Train on official 80% train pool, choose best by official Recall/FDR
+#      on the 20% val pool.
+#   2. Mix ShipRS train (mapped to 25 classes) with official train at a
+#      70/30 ratio; load stage-1 best checkpoint as the starting point and
+#      choose best again on official val.
+#
+# After both stages, the script:
+#   - Runs a bbox evaluation on official val.
+#   - Exports fixed-threshold per-class val predictions.
+#   - Reports official Recall/FDR metrics on val.
+#   - Composes 10000x10000 mosaics from val.
+#   - Runs batched sliding-window inference on every mosaic.
+#   - Reports metrics and max inference time on mosaics.
+#
+# All paths and ratios can be overridden via environment variables. The
+# script enforces `set -euo pipefail` so missing inputs/prior artifacts
+# abort immediately.
 
-set -e
-
-echo "备份数据集"
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+: "${PROJECT_ROOT:=$SCRIPT_DIR}"
+: "${DATA_ROOT:=$PROJECT_ROOT/data}"
+: "${SHIPRS_ROOT:=$PROJECT_ROOT/external_data/ShipRSImageNet}"
+: "${WORK_ROOT:=$PROJECT_ROOT/work_dirs}"
+: "${OFFICIAL_CONFIG:=$PROJECT_ROOT/configs/bafnet/aircraft_bafnet_1x.py}"
+: "${FINETUNE_CONFIG:=$PROJECT_ROOT/configs/bafnet/aircraft_bafnet_shiprs_mix_pretrain.py}"
+: "${OFFICIAL_WORK:=$WORK_ROOT/official_stage}"
+: "${FINETUNE_WORK:=$WORK_ROOT/shiprs_finetune_stage}"
+: "${OFFICIAL_WEIGHT:=0.70}"
+: "${SHIPRS_WEIGHT:=0.30}"
+: "${BIG_IMAGE_COUNT:=2}"
+: "${DEVICE:=cuda:0}"
+: "${NAMES:=HM,LQS,QHS,MS,A1_SU-35,A2_C-130,A3_C-17,A4_C-5,A5_F-16,A6_TU-160,A7_E-3,A8_B-52,A9_P-3C,A10_B-1B,A11_E-8,A12_TU-22,A13_F-15,A14_KC-135,A15_F-22,A16_FA-18,A17_TU-95,A18_KC-10,A19_SU-34,A20_SU-24,FSC}"
+
 cd "$PROJECT_ROOT"
 
-echo "Project root: $PROJECT_ROOT"
-echo "Backing up data/images/train and data/labels/train..."
+log() { printf '[run.sh] %s\n' "$*"; }
 
-if [ ! -d "data/images/train" ]; then
-    echo "ERROR: data/images/train not found, cannot backup." >&2
-    exit 1
+require_dir() {
+    local p="$1"
+    if [ ! -d "$p" ]; then
+        echo "ERROR: required directory not found: $p" >&2
+        exit 1
+    fi
+}
+
+require_file() {
+    local p="$1"
+    if [ ! -f "$p" ]; then
+        echo "ERROR: required file not found: $p" >&2
+        exit 1
+    fi
+}
+
+# Path safety: every rm is constrained to a path under a known anchor. Never
+# pass an unresolved path to rm -rf.
+safe_rm() {
+    local anchor="$1"
+    local target="$2"
+    case "$target" in
+        "$anchor"/*)
+            rm -rf "$target"
+            ;;
+        *)
+            echo "ERROR: refusing to remove $target (outside $anchor)" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ----------------------------------------------------------------------------
+# Stage 0: dataset preparation
+# ----------------------------------------------------------------------------
+
+require_file "$OFFICIAL_CONFIG"
+require_file "$FINETUNE_CONFIG"
+require_dir "$DATA_ROOT/images/train"
+require_dir "$DATA_ROOT/labels/train"
+
+OFFICIAL_TRAIN_BACKUP="$DATA_ROOT/../data_backup"
+mkdir -p "$DATA_ROOT/images" "$DATA_ROOT/labels"
+if [ -d "$OFFICIAL_TRAIN_BACKUP/images/train" ] && \
+        [ -d "$OFFICIAL_TRAIN_BACKUP/labels/train" ]; then
+    log "Restoring official source pool from $OFFICIAL_TRAIN_BACKUP"
+    # Mirror backup back to DATA_ROOT; val/ is owned by the split step.
+    safe_rm "$DATA_ROOT" "$DATA_ROOT/images/train"
+    safe_rm "$DATA_ROOT" "$DATA_ROOT/labels/train"
+    cp -r "$OFFICIAL_TRAIN_BACKUP/images/train" "$DATA_ROOT/images/"
+    cp -r "$OFFICIAL_TRAIN_BACKUP/labels/train" "$DATA_ROOT/labels/"
+else
+    log "Backing up official source pool to $OFFICIAL_TRAIN_BACKUP"
+    mkdir -p "$OFFICIAL_TRAIN_BACKUP/images" "$OFFICIAL_TRAIN_BACKUP/labels"
+    cp -r "$DATA_ROOT/images/train" "$OFFICIAL_TRAIN_BACKUP/images/"
+    cp -r "$DATA_ROOT/labels/train" "$OFFICIAL_TRAIN_BACKUP/labels/"
 fi
 
-if [ -d "data_backup/images/train" ] || [ -d "data_backup/labels/train" ]; then
-    echo "WARNING: data_backup/ already exists. Will be overwritten."
-    rm -rf data_backup
-fi
+log "Splitting official data 80/20 (no test split)"
+python tools/split_val.py --root "$DATA_ROOT" \
+    --ratios 0.8 0.2 --seed 0 --overwrite
 
-mkdir -p data_backup/images data_backup/labels
-cp -r data/images/train data_backup/images/
-cp -r data/labels/train data_backup/labels/
+log "Converting YOLO splits to COCO"
+python tools/convert_yolo_to_coco.py --root "$DATA_ROOT" --split train \
+    --out "$DATA_ROOT/annotations/instances_train.json"
+python tools/convert_yolo_to_coco.py --root "$DATA_ROOT" --split val \
+    --out "$DATA_ROOT/annotations/instances_val.json"
 
-echo "分割数据集"
+# ----------------------------------------------------------------------------
+# Stage 1: official-only training
+# ----------------------------------------------------------------------------
 
-python tools/split_val.py --root data --ratios 0.6 0.2 0.2 --seed 0 --overwrite
+log "Stage 1: official-only training (best by official Recall/FDR)"
+mkdir -p "$OFFICIAL_WORK"
+python tools/train.py "$OFFICIAL_CONFIG" "$OFFICIAL_WORK"
 
-echo "生成coco标注"
-python tools/convert_yolo_to_coco.py --root data --split train --out data/annotations/instances_train.json
-python tools/convert_yolo_to_coco.py --root data --split val --out data/annotations/instances_val.json
-python tools/convert_yolo_to_coco.py --root data --split test --out data/annotations/instances_test.json
+STAGE1_BEST="$OFFICIAL_WORK/best_official_recall_fdr.pth"
+require_file "$STAGE1_BEST"
+log "Stage 1 best: $STAGE1_BEST"
 
+# ----------------------------------------------------------------------------
+# Stage 2: mixed fine-tune (70% official / 30% ShipRS)
+# ----------------------------------------------------------------------------
 
-echo "仅ARFC"
-python tools/train.py configs/bafnet/aircraft_bafnet_1x.py work_dirs/new_data_arfc_only_v1
-echo "测试"
-python tools/test.py configs/bafnet/aircraft_bafnet_1x.py work_dirs/new_data_arfc_only_v1/best_bbox_mAP.pth work_dirs/new_data_arfc_only_v1/test_results --eval bbox --out work_dirs/new_data_arfc_only_v1/test_results/results.pkl
-echo "生成指标"
-NAMES="HM,LQS,QHS,MS,A1_SU-35,A2_C-130,A3_C-17,A4_C-5,A5_F-16,A6_TU-160,A7_E-3,A8_B-52,A9_P-3C,A10_B-1B,A11_E-8,A12_TU-22,A13_F-15,A14_KC-135,A15_F-22,A16_FA-18,A17_TU-95,A18_KC-10,A19_SU-34,A20_SU-24,FSC"
-python tools/eval_val_to_json.py --config configs/bafnet/aircraft_bafnet_1x.py --checkpoint work_dirs/new_data_arfc_only_v1/best_bbox_mAP.pth --img-dir data/images/test --gt data/annotations/instances_test.json --out work_dirs/new_data_arfc_only_v1/test_preds.json
+log "Preparing ShipRS mappings"
+require_dir "$SHIPRS_ROOT"
+python tools/prepare_shiprs.py --shiprs-root "$SHIPRS_ROOT" \
+    --out "$DATA_ROOT/external"
 
-python tools/eval_recall_fdr.py --pred work_dirs/new_data_arfc_only_v1/test_preds.json --gt data/annotations/instances_test.json --classes 25 --names $NAMES --out-prefix work_dirs/new_data_arfc_only_v1/test_metrics
+log "Stage 2: mixed fine-tune (load_from=$STAGE1_BEST, weights=$OFFICIAL_WEIGHT/$SHIPRS_WEIGHT)"
+mkdir -p "$FINETUNE_WORK"
+python tools/train.py "$FINETUNE_CONFIG" "$FINETUNE_WORK" \
+    --cfg-options load_from="$STAGE1_BEST" \
+        data.train.source_weights="($OFFICIAL_WEIGHT,$SHIPRS_WEIGHT)"
+
+STAGE2_BEST="$FINETUNE_WORK/best_official_recall_fdr.pth"
+require_file "$STAGE2_BEST"
+log "Stage 2 best: $STAGE2_BEST"
+
+# ----------------------------------------------------------------------------
+# Stage 3: validation reporting (ordinary + big-image)
+# ----------------------------------------------------------------------------
+
+VAL_PRED="$FINETUNE_WORK/val_preds.json"
+VAL_METRICS_PREFIX="$FINETUNE_WORK/val_metrics"
+
+log "Exporting val predictions with fixed per-class thresholds"
+python tools/eval_val_to_json.py \
+    --config "$OFFICIAL_CONFIG" \
+    --checkpoint "$STAGE2_BEST" \
+    --img-dir "$DATA_ROOT/images/val" \
+    --gt "$DATA_ROOT/annotations/instances_val.json" \
+    --out "$VAL_PRED"
+
+log "Reporting official Recall/FDR metrics on val"
+python tools/eval_recall_fdr.py \
+    --pred "$VAL_PRED" \
+    --gt "$DATA_ROOT/annotations/instances_val.json" \
+    --classes 25 --names "$NAMES" \
+    --out-prefix "$VAL_METRICS_PREFIX"
+
+BIG_VAL_ROOT="$FINETUNE_WORK/big_val"
+BIG_VAL_IMG_DIR="$BIG_VAL_ROOT/images"
+BIG_VAL_GT="$BIG_VAL_ROOT/instances_big_val.json"
+BIG_VAL_MAP="$BIG_VAL_ROOT/source_map.json"
+BIG_VAL_PRED="$BIG_VAL_ROOT/predictions.json"
+BIG_VAL_TIMING="$BIG_VAL_ROOT/timing.json"
+BIG_VAL_METRICS_PREFIX="$BIG_VAL_ROOT/metrics"
+
+log "Composing $BIG_IMAGE_COUNT mosaic(s) at 10000x10000"
+python tools/compose_big_val.py \
+    --gt "$DATA_ROOT/annotations/instances_val.json" \
+    --img-dir "$DATA_ROOT/images/val" \
+    --out-dir "$BIG_VAL_ROOT" \
+    --num-canvases "$BIG_IMAGE_COUNT" \
+    --seed 0
+
+log "Running sliding-window batch inference on mosaics"
+python tools/infer_big_image.py \
+    --config "$OFFICIAL_CONFIG" \
+    --checkpoint "$STAGE2_BEST" \
+    --img-dir "$BIG_VAL_IMG_DIR" \
+    --gt "$BIG_VAL_GT" \
+    --out "$BIG_VAL_PRED" \
+    --timing-out "$BIG_VAL_TIMING" \
+    --device "$DEVICE"
+
+log "Reporting official metrics on mosaics"
+python tools/eval_recall_fdr.py \
+    --pred "$BIG_VAL_PRED" \
+    --gt "$BIG_VAL_GT" \
+    --classes 25 --names "$NAMES" \
+    --out-prefix "$BIG_VAL_METRICS_PREFIX"
+
+log "Done."
+log "Artifacts:"
+log "  Stage 1 best:        $STAGE1_BEST (+ $OFFICIAL_WORK/best_official_recall_fdr.json)"
+log "  Stage 2 best:        $STAGE2_BEST (+ $FINETUNE_WORK/best_official_recall_fdr.json)"
+log "  Val predictions:     $VAL_PRED"
+log "  Val metrics:         ${VAL_METRICS_PREFIX}.{json,csv}"
+log "  Mosaic GT:           $BIG_VAL_GT"
+log "  Mosaic source map:   $BIG_VAL_MAP"
+log "  Mosaic predictions:  $BIG_VAL_PRED"
+log "  Mosaic timing:       $BIG_VAL_TIMING (max_inference_seconds)"
+log "  Mosaic metrics:      ${BIG_VAL_METRICS_PREFIX}.{json,csv}"
