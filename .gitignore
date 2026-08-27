@@ -7,6 +7,7 @@
 /new_data/
 /external_data/
 new.xlsx
+test.py
 new_run.sh
 
 # Training, inference, and analysis artifacts
