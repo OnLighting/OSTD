@@ -10,7 +10,7 @@ import random
 import numpy as np
 from mmdet.core import PolygonMasks
 
-from .builder import PIPELINES
+from ..builder import PIPELINES
 
 
 @PIPELINES.register_module()
