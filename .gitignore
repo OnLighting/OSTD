@@ -6,6 +6,8 @@
 /data/
 /new_data/
 /external_data/
+new.xlsx
+new_run.sh
 
 # Training, inference, and analysis artifacts
 /work_dirs/
