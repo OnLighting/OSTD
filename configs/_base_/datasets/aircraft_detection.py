@@ -50,14 +50,11 @@ data = dict(
         ann_file=data_root + 'annotations/instances_val.json',
         img_prefix=data_root + 'images/val/',
         pipeline=test_pipeline),
-    # `data.test` 仅作为 tools/test.py 依赖的接口别名使用；官方流水线并
-    # 不创建独立的 test 拆分，best checkpoint 选择和最终指标均在 data.val
-    # 上计算和报告。
     test=dict(
         type=dataset_type,
-        ann_file=data_root + 'annotations/instances_val.json',
-        img_prefix=data_root + 'images/val/',
+        ann_file=data_root + 'annotations/instances_test.json',
+        img_prefix=data_root + 'images/test/',
         pipeline=test_pipeline))
-# 训练期 EvalHook 同时计算 bbox (COCO mAP, 用于诊断) 和 official
-# (Recall/FDR, 用于 best 选择与早停);详见 mmdet/core/evaluation/official_metrics.py。
-evaluation = dict(interval=1, metric=['bbox', 'official'])
+# 训练期 EvalHook 只使用 data.val 做早停与 best checkpoint 选择。
+# tools/test.py 使用独立 data.test；最终 Recall/FDR/AP 也统一在 test 上报告。
+evaluation = dict(interval=1, metric='bbox')

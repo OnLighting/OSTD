@@ -58,11 +58,11 @@ The active dataset lives in **`new_data/`** (YOLO-style), not `data/`. `new_data
 
 - `new_data/dataset.yaml` — class names (25) and split declarations.
 - `new_data/images/train/` (4481 imgs), `new_data/labels/train/` (4481 YOLO `.txt`).
-- `new_data/val/` is declared but **empty** — `tools/split_val.py` creates the real 80/20 train/val split at run time. There is no independent test split; final metrics are reported on the val pool only.
+- `new_data/val/`, `new_data/test/` are declared but **empty/absent** — `tools/split_val.py` creates the real train/val/test split at run time.
 - `new_data/background_only.txt` — 3 explicitly-retained negative samples (images whose labels are empty on purpose).
 - Class imbalance is severe: max `A16_FA-18` (2148) vs min `HM` (17), ratio ~177×. The dataset pipeline wraps training in `ClassBalancedDataset(oversample_thr=1e-3)` to up-sample rare classes.
 
-The mmdet dataset config (`configs/_base_/datasets/aircraft_detection.py`) expects **COCO-format** annotations at `./data/annotations/instances_train.json` and `instances_val.json` with images at `./data/images/{train,val}/`. `data.test` is configured as an alias pointing at the same val paths so `tools/test.py` (and any external tooling) keeps working, but the official pipeline never builds a separate test split. The conversion is done by `tools/convert_yolo_to_coco.py` (driven by `run.sh`). So the flow is: YOLO data in `new_data/` → `split_val.py` → `convert_yolo_to_coco.py` → COCO annotations under `data/` → training.
+The mmdet dataset config (`configs/_base_/datasets/aircraft_detection.py`) expects **COCO-format** annotations at `./data/annotations/instances_{train,val,test}.json` with images at `./data/images/{train,val,test}/`. The conversion is done by `tools/convert_yolo_to_coco.py` (driven by `run.sh`). So the flow is: YOLO data in `new_data/` → `split_val.py` → `convert_yolo_to_coco.py` → COCO annotations under `data/` → training.
 
 ## Install / environment
 
@@ -93,19 +93,20 @@ The canonical end-to-end pipeline is `run.sh` (run from repo root). It backs up 
 Manual single steps (matches what `run.sh` invokes):
 
 ```
-# split + COCO conversion (80/20 only — no test split)
-python tools/split_val.py --root data --ratios 0.8 0.2 --seed 0 --overwrite
+# split + COCO conversion
+python tools/split_val.py --root data --ratios 0.6 0.2 0.2 --seed 0 --overwrite
 python tools/convert_yolo_to_coco.py --root data --split train --out data/annotations/instances_train.json
 python tools/convert_yolo_to_coco.py --root data --split val   --out data/annotations/instances_val.json
+python tools/convert_yolo_to_coco.py --root data --split test  --out data/annotations/instances_test.json
 
 # train (note: work_dir is a positional arg here, unlike stock mmdet)
 python tools/train.py configs/bafnet/aircraft_bafnet_1x.py work_dirs/<run>
 
-# evaluate (data.test is an alias of data.val in the official pipeline)
-python tools/test.py configs/bafnet/aircraft_bafnet_1x.py work_dirs/<run>/best_official_recall_fdr.pth --eval bbox
+# evaluate
+python tools/test.py configs/bafnet/aircraft_bafnet_1x.py work_dirs/<run>/best_bbox_mAP.pth --eval bbox
 
 # recall / FDR metrics (class names passed via --names)
-python tools/eval_recall_fdr.py --pred <preds.json> --gt data/annotations/instances_val.json \
+python tools/eval_recall_fdr.py --pred <preds.json> --gt data/annotations/instances_test.json \
     --classes 25 --names HM,LQS,QHS,MS,A1_SU-35,...,FSC --out-prefix work_dirs/<run>/test_metrics
 ```
 

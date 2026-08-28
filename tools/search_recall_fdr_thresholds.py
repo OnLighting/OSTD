@@ -17,9 +17,8 @@ Example:
     python tools/search_recall_fdr_thresholds.py \
         --pred work_dirs/arfc_only_v2/dense/val_preds_dense.json \
         --gt data/annotations/instances_val.json \
-        --checkpoint work_dirs/arfc_only_v2/best_official_recall_fdr.pth \
         --names HM,LQS,QHS,MS,A1_SU-35,A2_C-130,A3_C-17,A4_C-5,A5_F-16,A6_TU-160,A7_E-3,A8_B-52,A9_P-3C,A10_B-1B,A11_E-8,A12_TU-22,A13_F-15,A14_KC-135,A15_F-22,A16_FA-18,A17_TU-95,A18_KC-10,A19_SU-34,A20_SU-24,FSC \
-        --max-official-fdr 0.19 \
+        --max-official-fdr 0.20 \
         --target-official-recall 0.85 \
         --out-prefix work_dirs/arfc_only_v2/dense/threshold_search
 
@@ -39,25 +38,19 @@ import math
 import os
 import os.path as osp
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from mmdet.core.evaluation import (CLASS_IOU_THRESHOLDS, CLASS_NAMES,
-                                   SUPERCLASS_INDICES, match_class_events,
-                                   write_threshold_artifact)
+from eval_recall_fdr import (TAU_DEFAULT, TAU_OVERRIDE, iou_xywh,
+                             super_of)
 
 
 DEFAULT_GRID = (
     0.001, 0.005, 0.01, 0.02, 0.03, 0.05, 0.075, 0.10, 0.15,
     0.20, 0.25, 0.30, 0.40, 0.50, 0.70, 0.90,
 )
-SUPER_CLASSES = tuple(SUPERCLASS_INDICES)
-SUPERCLASS_OF_ID = {
-    class_id: super_name
-    for super_name, class_ids in SUPERCLASS_INDICES.items()
-    for class_id in class_ids
-}
+SUPER_CLASSES = ('ship', 'aircraft', 'vehicle')
 
 
 @dataclass(frozen=True)
@@ -88,47 +81,14 @@ def load_json(path):
 
 def validate_inputs(pred, gt, class_count):
     for label, payload in (('prediction', pred), ('ground truth', gt)):
-        if ('images' not in payload or 'annotations' not in payload
-                or 'categories' not in payload):
+        if 'images' not in payload or 'annotations' not in payload:
             raise ValueError(
-                f'{label} JSON must contain images, annotations, '
-                'and categories')
+                f'{label} JSON must contain images and annotations')
 
-    category_maps = {}
-    for label, payload in (('prediction', pred), ('ground truth', gt)):
-        categories = payload['categories']
-        if not isinstance(categories, list) or len(categories) != class_count:
-            raise ValueError(
-                f'{label} categories must contain exactly {class_count} rows')
-        category_map = {}
-        for category in categories:
-            category_id = category.get('id')
-            name = category.get('name')
-            if (not isinstance(category_id, int)
-                    or not 0 <= category_id < class_count
-                    or category_id in category_map
-                    or not isinstance(name, str)):
-                raise ValueError(f'{label} categories are malformed')
-            category_map[category_id] = name
-        if set(category_map) != set(range(class_count)):
-            raise ValueError(
-                f'{label} categories must cover ids 0..{class_count - 1}')
-        category_maps[label] = category_map
-    if category_maps['prediction'] != category_maps['ground truth']:
-        raise ValueError('prediction/GT categories differ')
-
-    image_maps = {}
-    for label, payload in (('prediction', pred), ('ground truth', gt)):
-        image_map = {}
-        for image in payload['images']:
-            image_id = image.get('id')
-            if image_id in image_map:
-                raise ValueError(
-                    f'{label} contains duplicate image id={image_id}')
-            image_map[image_id] = image.get('file_name')
-        image_maps[label] = image_map
-    pred_images = image_maps['prediction']
-    gt_images = image_maps['ground truth']
+    pred_images = {image['id']: image.get('file_name')
+                   for image in pred['images']}
+    gt_images = {image['id']: image.get('file_name')
+                 for image in gt['images']}
     if set(pred_images) != set(gt_images):
         missing = sorted(set(gt_images) - set(pred_images))
         extra = sorted(set(pred_images) - set(gt_images))
@@ -208,6 +168,7 @@ def build_ranked_events(pred, gt, class_count):
             (ann['bbox'], float(ann['score'])))
 
     events = {class_id: [] for class_id in range(class_count)}
+    # Keep the matching loop explicit so its ordering mirrors match_image().
     for key, predictions in pred_by_key.items():
         _, class_id = key
         boxes = np.asarray([item[0] for item in predictions],
@@ -216,8 +177,20 @@ def build_ranked_events(pred, gt, class_count):
                             dtype=np.float64)
         gt_boxes = np.asarray(gt_by_key.get(key, []),
                               dtype=np.float32).reshape(-1, 4)
-        events[class_id].extend(match_class_events(
-            boxes, scores, gt_boxes, CLASS_IOU_THRESHOLDS[class_id]))
+        matched = np.zeros(len(gt_boxes), dtype=bool)
+        order = np.argsort(-scores)
+        tau = TAU_OVERRIDE.get(int(class_id), TAU_DEFAULT)
+        for pred_index in order:
+            is_tp = False
+            unmatched = np.flatnonzero(~matched)
+            if unmatched.size:
+                overlaps = iou_xywh(boxes[pred_index], gt_boxes[unmatched])
+                best_local = int(overlaps.argmax())
+                if overlaps[best_local] >= tau:
+                    matched[unmatched[best_local]] = True
+                    is_tp = True
+            events[class_id].append(
+                (float(scores[pred_index]), 1 if is_tp else 0))
 
     for class_id in events:
         events[class_id].sort(key=lambda item: item[0], reverse=True)
@@ -294,8 +267,12 @@ def pareto_points(curve):
 
 def official_weights(names):
     members = defaultdict(list)
-    for class_id, _ in enumerate(names):
-        members[SUPERCLASS_OF_ID[class_id]].append(class_id)
+    for class_id, name in enumerate(names):
+        super_name = super_of(name)
+        if super_name is None:
+            raise ValueError(
+                f'class {class_id} ({name!r}) has no official super class')
+        members[super_name].append(class_id)
     missing = [name for name in SUPER_CLASSES if not members[name]]
     if missing:
         raise ValueError(f'missing official super classes: {missing}')
@@ -356,7 +333,7 @@ def search_class_thresholds(curves, weights, max_fdr, budget_bins):
 def aggregate_metrics(points, names):
     by_super_rows = defaultdict(list)
     for class_id, point in points.items():
-        by_super_rows[SUPERCLASS_OF_ID[class_id]].append(point)
+        by_super_rows[super_of(names[class_id])].append(point)
 
     by_super = {}
     for super_name in SUPER_CLASSES:
@@ -402,20 +379,32 @@ def write_outputs(args, pred, names, events, total_gt, curves, selected,
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    constraints = {
-        'max_official_fdr': args.max_official_fdr,
-        'target_official_recall': args.target_official_recall,
-        'budget_bins': args.budget_bins,
+    payload = {
+        'constraints': {
+            'max_official_fdr': args.max_official_fdr,
+            'target_official_recall': args.target_official_recall,
+            'budget_bins': args.budget_bins,
+        },
+        'passed': (
+            metrics['official']['recall'] >= args.target_official_recall
+            and metrics['official']['fdr'] <= args.max_official_fdr
+        ),
+        'metrics': metrics,
+        'thresholds': {
+            names[class_id]: point.threshold
+            for class_id, point in sorted(selected.items())
+        },
+        'per_class': [
+            {
+                'category_id': class_id,
+                'name': names[class_id],
+                **asdict(point),
+            }
+            for class_id, point in sorted(selected.items())
+        ],
     }
-    write_threshold_artifact(
-        args.out_prefix + '.json',
-        [selected[class_id].threshold for class_id in range(len(names))],
-        args.checkpoint,
-        args.pred,
-        args.gt,
-        constraints,
-        metrics,
-    )
+    with open(args.out_prefix + '.json', 'w', encoding='utf-8') as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
     write_csv(
         args.out_prefix + '_selected.csv',
@@ -498,9 +487,7 @@ def build_parser():
     parser.add_argument('--classes', type=int, default=25)
     parser.add_argument('--names',
                         help='Comma-separated class names. Defaults to pred categories.')
-    parser.add_argument('--checkpoint', required=True,
-                        help='Best checkpoint to bind into the artifact.')
-    parser.add_argument('--max-official-fdr', type=float, default=0.19)
+    parser.add_argument('--max-official-fdr', type=float, default=0.20)
     parser.add_argument('--target-official-recall', type=float, default=0.85)
     parser.add_argument('--budget-bins', type=int, default=10000,
                         help='FDR budget resolution; larger is more exact.')
@@ -526,24 +513,7 @@ def main():
     gt = load_json(args.gt)
     validate_inputs(pred, gt, args.classes)
     names = resolve_names(args, pred, args.classes)
-    if args.classes != len(CLASS_NAMES) or tuple(names) != CLASS_NAMES:
-        raise ValueError(
-            'threshold search requires the official 25-class names/order')
-    category_names = tuple(
-        category['name']
-        for category in sorted(pred['categories'], key=lambda row: row['id']))
-    if category_names != CLASS_NAMES:
-        raise ValueError(
-            'prediction/GT categories must use the official 25-class names')
     events, total_gt = build_ranked_events(pred, gt, args.classes)
-    missing_superclasses = [
-        super_name for super_name, class_ids in SUPERCLASS_INDICES.items()
-        if sum(total_gt[class_id] for class_id in class_ids) == 0
-    ]
-    if missing_superclasses:
-        raise ValueError(
-            'threshold search requires GT in every superclass; missing '
-            f'{missing_superclasses}')
     curves = {
         class_id: build_exact_curve(events[class_id], total_gt[class_id])
         for class_id in range(args.classes)

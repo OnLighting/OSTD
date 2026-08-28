@@ -1,14 +1,13 @@
 # configs/bafnet/aircraft_bafnet_shiprs_mix_pretrain.py
 #
-# 主目标: 在第一阶段 (官方数据 80%) 训练得到的 best_official_recall_fdr.pth
-# 之上, 用 ShipRSImageNet level_3 数据集强化 25 类中 HM/LQS/QHS(+ 可选 MS)
-# 4 个船舰类, 同时严格控制其他 21 类的回退。
+# 主目标: 在已有 25 类 best checkpoint 上, 用 ShipRSImageNet level_3 数据集
+# 强化 25 类中 HM/LQS/QHS(+ 可选 MS) 4 个船舰类, 同时严格控制其他 21 类的回退。
 #
 # 设计要点:
-# 1) num_classes=25 不改 —— 与 best_official_recall_fdr.pth strict 兼容,
-#    直接 load_from。run.sh 会通过 --cfg-options load_from=<stage1 best> 覆写。
-# 2) SourceBalancedDataset 混合 25 类官方 train + ShipRS mapped level_3,
-#    sampling = 0.70 : 0.30 (默认 70% 官方 / 30% ShipRS)。
+# 1) num_classes=25 不改 —— 与 best_bbox_mAP.pth strict 兼容, 直接 load_from。
+# 2) SourceBalancedDataset 混合 25 类训练集 + ShipRS mapped level_3,
+#    sampling = 0.65 : 0.35。25 类老样本继续提供 anchor (防 BN 漂移 +
+#    fc_cls 其余 22 列不被挤占)。
 # 3) 短 schedule + 小 LR (lr=0.001, max_epochs=24, step=[16, 22])。
 # 4) 关闭 SBLA —— HieAssigner 已是 25 类默认, 不要把它的超参 schedule
 #    带到船上。
@@ -17,9 +16,6 @@
 #    覆盖类别不均)。
 # 7) shiprs_class_mask=True —— fc_cls 通道 mask, 严格隔离 25 类中
 #    非目标 21 类的回退。fc_reg 全开 (4 维 class-agnostic)。
-# 8) val/test 都指向官方 val (官方流水线无独立 test 拆分, test 仅作兼容
-#    别名);EvalHook 同时输出 bbox (mAP 诊断) 和 official (官方 Recall/FDR
-#    选 best)。ShipRS val 用于审计而不参与 best 选择。
 
 _base_ = ['./aircraft_bafnet_1x.py']
 
@@ -66,10 +62,8 @@ data = dict(
     workers_per_gpu=2,
     train=dict(
         _delete_=True,
-        # 70% 官方 train / 30% ShipRS — run.sh 可通过
-        # --cfg-options data.train.source_weights="(0.7,0.3)" 覆盖。
         type='SourceBalancedDataset',
-        source_weights=(0.70, 0.30),
+        source_weights=(0.65, 0.35),  # 25 类 : ShipRS
         seed=20260819,
         datasets=[
             dict(
@@ -90,25 +84,21 @@ data = dict(
         ]),
     val=dict(
         _delete_=True,
-        # 官方 val：best 选择在官方 val 上做，ShipRS val 只用于数据审计，
-        # 不进入 EvalHook。
         type='AircraftDataset',
         ann_file='data/annotations/instances_val.json',
         img_prefix='data/images/val/',
         pipeline=ship_test_pipeline),
     test=dict(
         _delete_=True,
-        # 官方流水线无独立 test 拆分；test 仅作 tools/test.py 的接口别名。
         type='AircraftDataset',
-        ann_file='data/annotations/instances_val.json',
-        img_prefix='data/images/val/',
+        ann_file='data/annotations/instances_test.json',
+        img_prefix='data/images/test/',
         pipeline=ship_test_pipeline),
 )
 
 
 # === 关键: strict load_from ===
-# run.sh 会用第一阶段 best_official_recall_fdr.pth 覆盖这里的默认值。
-load_from = None
+load_from = 'work_dirs/arfc_only_v1/best_bbox_mAP.pth'
 resume_from = None  # 重新训练, 不续 epoch / optimizer 状态
 
 
@@ -121,8 +111,8 @@ lr_config = dict(
 runner = dict(type='EpochBasedRunner', max_epochs=24)
 
 
-# === EvalHook 每 1 epoch 同时计算 bbox (mAP 诊断) 和 official (Recall/FDR) ===
-evaluation = dict(interval=1, metric=['bbox', 'official'])
+# === EvalHook 仍然每 1 epoch 跑 25 类 val (best mAP 选择) ===
+evaluation = dict(interval=1, metric='bbox')
 
 
 # === ShipRS 通道 mask 开关 ===
