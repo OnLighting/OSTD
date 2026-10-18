@@ -1,0 +1,67 @@
+# Agent / worktree scratch
+/.worktrees/
+/.superpowers/
+/.claude/
+/.codex_tmp*/
+/codex_*
+
+# Local research artifacts (not part of the release)
+/experiments/
+/diagnostics/
+/paper_assets/
+/pdf_pages/
+/scripts/
+/tests/
+/tmp_boundary_paper*.txt
+/*.docx
+/Methodology_*.md
+/论文方法论中文稿*.md
+/new_model/
+
+# Datasets and generated COCO manifests
+/data/
+/new_data/
+/external_data/
+
+# Training, inference, and analysis artifacts
+/work_dirs/
+/output/
+/outputs/
+/wandb/
+*.log
+/test_preds.json
+/test_metrics.json
+/test_metrics.csv
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.onnx
+
+# Archives and downloaded bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+*.crdownload
+nature-skill/
+
+# Python / build caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
