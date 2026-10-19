@@ -14,3 +14,13 @@
 | HRRSD | [HRRSD.zip](https://pan.quark.cn/s/5565eee34e88?pwd=Y6C9) | `Y6C9` |
 | DIOR | [DIOR.zip](https://pan.quark.cn/s/dd446ecb35b2?pwd=L7Zm) | `L7Zm` |
 | VisDrone | [VisDrone.zip](https://pan.quark.cn/s/1e770ae2572e?pwd=UvYu) | `UvYu` |
+
+## 运行命令
+
+以 DIOR 数据集训练 RASA-Net 为例：安装项目依赖并准备好 COCO 格式的数据后，在项目根目录的 Bash 终端中运行以下命令（需要 3 张 CUDA GPU）：
+
+```bash
+bash tools/dist_train.sh configs/ostd/ostd_dior_1x.py 3 work_dirs/rasa_net_dior --seed 0
+```
+
+数据默认位于 `data/DIOR_coco/`，训练标注为 `annotations/instances_trainval.json`，训练图片路径相对于 `images/`；验证使用 `annotations/instances_test.json` 和 `images/test/`。如数据存放位置不同，请修改配置中的 `ann_file` 和 `img_prefix`。训练日志和模型权重将保存到 `work_dirs/rasa_net_dior/`。
