@@ -1,4 +1,6 @@
-# OSTD
+# RASA-Net
+
+**Paper:** RASA-Net: Adaptive Receptive Fields and Scale-Balanced Label Assignment for Remote Sensing Small Object Detection
 
 **Author:** lxh &lt;2356338071@qq.com&gt;
 
